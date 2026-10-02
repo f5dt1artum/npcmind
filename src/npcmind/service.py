@@ -1,8 +1,10 @@
 """Core service surface for NpcMind.
 
-Provides process health reporting plus a stateless behavior-tree evaluator.
-Each ``evaluate_behavior`` call executes exactly one tick of the supplied
-tree against the supplied blackboard; no state is kept between calls.
+Provides process health reporting, a stateless behavior-tree evaluator, and
+a single-step finite-state-machine advance. Each ``evaluate_behavior`` call
+executes exactly one tick of the supplied tree against the supplied
+blackboard; each ``step_state_machine`` call processes exactly one event and
+returns the deterministic next state. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -15,10 +17,15 @@ STATUSES = ("SUCCESS", "FAILURE", "RUNNING")
 _COMPOSITE_TYPES = ("sequence", "selector")
 _CONDITION_OPS = ("exists", "equals", "not_equals")
 _ACTION_OPS = ("set", "delete", "status")
+_MACHINE_ACTION_OPS = ("set", "delete")
 
 
 class TreeError(ValueError):
     """Raised when a behavior-tree request fails structural validation."""
+
+
+class MachineError(ValueError):
+    """Raised when a state-machine request fails structural validation."""
 
 
 def _is_valid_key(key: Any) -> bool:
@@ -105,6 +112,96 @@ def _run_action(node: dict, blackboard: dict) -> str:
     return node["status"]  # op == "status"
 
 
+def _validate_machine_condition(condition: Any, where: str) -> None:
+    if not isinstance(condition, dict):
+        raise MachineError(f"{where}: condition must be an object")
+    op = condition.get("op")
+    if op not in _CONDITION_OPS:
+        raise MachineError(f"{where}: unknown condition op {op!r}")
+    if not _is_valid_key(condition.get("key")):
+        raise MachineError(f"{where}: condition requires a non-empty string key")
+    if op in ("equals", "not_equals") and "value" not in condition:
+        raise MachineError(f"{where}: condition op {op!r} requires a value")
+
+
+def _validate_machine_action(action: Any, where: str) -> None:
+    if not isinstance(action, dict):
+        raise MachineError(f"{where}: action must be an object")
+    op = action.get("op")
+    if op not in _MACHINE_ACTION_OPS:
+        raise MachineError(f"{where}: unknown action op {op!r}")
+    if not _is_valid_key(action.get("key")):
+        raise MachineError(f"{where}: action op {op!r} requires a non-empty string key")
+    if op == "set" and "value" not in action:
+        raise MachineError(f"{where}: action op 'set' requires a value")
+
+
+def _validate_machine(machine: Any) -> tuple[set[str], list]:
+    """Validate the machine definition; return (state ids, transitions)."""
+    if not isinstance(machine, dict):
+        raise MachineError("machine must be an object")
+    states = machine.get("states")
+    if not isinstance(states, list) or not states:
+        raise MachineError("machine.states must be a non-empty list")
+    state_ids: set[str] = set()
+    for index, state in enumerate(states):
+        where = f"states[{index}]"
+        if not isinstance(state, dict):
+            raise MachineError(f"{where} must be an object")
+        state_id = state.get("id")
+        if not _is_valid_key(state_id):
+            raise MachineError(f"{where} requires a non-empty string id")
+        if state_id in state_ids:
+            raise MachineError(f"duplicate state id {state_id!r}")
+        state_ids.add(state_id)
+
+    initial = machine.get("initial")
+    if not isinstance(initial, str) or initial not in state_ids:
+        raise MachineError(f"initial {initial!r} does not reference a declared state")
+
+    transitions = machine.get("transitions")
+    if not isinstance(transitions, list):
+        raise MachineError("machine.transitions must be a list")
+    transition_ids: set[str] = set()
+    for index, transition in enumerate(transitions):
+        where = f"transitions[{index}]"
+        if not isinstance(transition, dict):
+            raise MachineError(f"{where} must be an object")
+        transition_id = transition.get("id")
+        if not _is_valid_key(transition_id):
+            raise MachineError(f"{where} requires a non-empty string id")
+        if transition_id in transition_ids:
+            raise MachineError(f"duplicate transition id {transition_id!r}")
+        transition_ids.add(transition_id)
+        where = f"transition {transition_id!r}"
+        for field in ("from", "to"):
+            ref = transition.get(field)
+            if not isinstance(ref, str) or ref not in state_ids:
+                raise MachineError(f"{where}: {field} {ref!r} does not reference a declared state")
+        if not _is_valid_key(transition.get("event")):
+            raise MachineError(f"{where}: event must be a non-empty string")
+        if "condition" in transition:
+            _validate_machine_condition(transition["condition"], where)
+        actions = transition.get("actions", [])
+        if not isinstance(actions, list):
+            raise MachineError(f"{where}: actions must be a list")
+        for action_index, action in enumerate(actions):
+            _validate_machine_action(action, f"{where}.actions[{action_index}]")
+    return state_ids, transitions
+
+
+def _condition_holds(condition: dict, blackboard: dict) -> bool:
+    op = condition["op"]
+    key = condition["key"]
+    if op == "exists":
+        return key in blackboard
+    if key not in blackboard:
+        return False
+    if op == "equals":
+        return _json_equal(blackboard[key], condition["value"])
+    return not _json_equal(blackboard[key], condition["value"])  # not_equals
+
+
 def _tick(node: dict, blackboard: dict, trace: list) -> str:
     node_type = node["type"]
     if node_type == "sequence":
@@ -128,7 +225,7 @@ def _tick(node: dict, blackboard: dict, trace: list) -> str:
 
 
 class Service:
-    """Health reporting plus stateless behavior-tree evaluation."""
+    """Health reporting, stateless behavior-tree evaluation, and FSM stepping."""
 
     name = "npcmind"
     version = __version__
@@ -160,3 +257,66 @@ class Service:
         trace: list = []
         status = _tick(tree, board, trace)
         return {"status": status, "blackboard": board, "trace": trace}
+
+    def step_state_machine(self, request: dict) -> dict:
+        """Advance ``request['machine']`` by exactly one event.
+
+        The caller carries the state explicitly: ``current_state`` defaults
+        to the machine's ``initial`` state and the returned ``state`` is the
+        deterministic next state. The machine and the request are fully
+        validated before any action runs; raises ValueError (MachineError)
+        on any structural problem. A call that matches no transition is not
+        an error: state and blackboard are returned unchanged and
+        ``transition`` is None.
+        """
+        if not isinstance(request, dict):
+            raise MachineError("request must be a JSON object")
+        if "machine" not in request:
+            raise MachineError("request is missing 'machine'")
+        machine = request["machine"]
+        event = request.get("event")
+        if not isinstance(event, str):
+            raise MachineError("event must be a string")
+        blackboard = request.get("blackboard", {})
+        if not isinstance(blackboard, dict):
+            raise MachineError("blackboard must be an object")
+        for key in blackboard:
+            if not _is_valid_key(key):
+                raise MachineError(f"blackboard key {key!r} must be a non-empty string")
+
+        state_ids, transitions = _validate_machine(machine)
+
+        current = request.get("current_state", machine["initial"])
+        if not isinstance(current, str) or current not in state_ids:
+            raise MachineError(f"current_state {current!r} does not reference a declared state")
+
+        board = dict(blackboard)
+        trace: list = []
+        hit: dict | None = None
+        for transition in transitions:
+            if transition["from"] != current or transition["event"] != event:
+                continue
+            condition = transition.get("condition")
+            holds = True if condition is None else _condition_holds(condition, board)
+            trace.append({"id": transition["id"], "condition": holds})
+            if holds:
+                hit = transition
+                break
+
+        if hit is None:
+            new_state = current
+        else:
+            for action in hit.get("actions", []):
+                if action["op"] == "set":
+                    board[action["key"]] = action["value"]
+                else:  # delete
+                    board.pop(action["key"], None)
+            new_state = hit["to"]
+
+        return {
+            "previous_state": current,
+            "state": new_state,
+            "transition": hit["id"] if hit is not None else None,
+            "blackboard": board,
+            "trace": trace,
+        }
