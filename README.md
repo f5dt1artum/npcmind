@@ -18,10 +18,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/goap/plan` 执行一次性目标导向行动规划：请求体为 `{"world": {...}, "goal": {...}, "actions": [...]}`，`world` 与 `goal` 为以非空字符串作键的 JSON 对象；每个行动含全局唯一的非空字符串 `id`、可省略的 `cost`（默认 1，仅允许正整数）、可省略的 `preconditions` 与 `effects`（省略视为空对象）。前置条件仅在当前状态存在同名键且值相等时成立；效果覆盖对应键，其余状态项保留；目标的全部键存在且相等即满足（世界可含额外键）。值比较沿用现有规则：布尔值不等于数字，整数与浮点数按数值比较，对象与数组递归比较。初始状态已满足目标时返回 `status` 为 `SUCCESS`、空 `plan`、`cost` 为 0 及原始 `final_world`；否则返回总成本最低的计划（`plan` 按执行顺序列出行动 id，`cost` 为总成本，`final_world` 为执行后状态），成本相同时按行动在输入列表中的位置序列作字典序比较并取最小者。目标不可达时返回 `status` 为 `UNREACHABLE`、空 `plan`、`cost` 为 `null` 及原始 `world` 作为 `final_world`。请求在搜索前完整校验，非法时返回 422 `invalid_goap`，Python 侧等价入口 `Service.plan_goap(request)` 抛出 `ValueError`；调用不保存跨请求状态，也不修改传入的请求及其嵌套对象。
 
+`POST /v1/navigation/path` 执行无状态的二维方格寻路：请求体为 `{"grid": [[...]], "start": {"x", "y"}, "goal": {"x", "y"}}`。`grid` 为非空矩形二维数组，每格只能是 `null`（不可通行）或正整数（进入该格的代价，布尔值不视为整数）；坐标为含整数 `x`、`y` 的对象，左上角为原点、x 向右、y 向下，仅允许上下左右相邻移动。成功返回 `status` 为 `SUCCESS`、含两端点的 `path`（按移动顺序排列的同类坐标对象）与不计起点、按进入后续格代价累加的 `cost`；结果取总成本最低路线，等成本时将完整路线按各坐标的 y、x 顺序组成序列作字典序比较并取最小者，保证同一请求结果确定。起点等于终点时返回只含该点的 `path` 与 0 成本；目标不可达（非请求错误）时返回 `status` 为 `UNREACHABLE`、空 `path` 与 `null` cost。请求或坐标不是对象、`grid` 为空或不规则、格值非法、坐标字段缺失或含布尔值、坐标越界，以及起点或终点落在不可通行格上，均在搜索前完整校验并返回 422 `invalid_navigation`，Python 侧等价入口 `Service.find_path(request)` 抛出 `ValueError`，不返回部分路线；调用不保存跨请求的地图或搜索状态，也不修改传入请求及其嵌套值。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值、有限状态机的单步推进与一次性 GOAP 规划；寻路等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划与无状态二维方格寻路；其余能力仍留给后续任务从已冻结事实出发独立设计并验证。

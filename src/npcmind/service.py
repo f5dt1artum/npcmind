@@ -1,12 +1,14 @@
 """Core service surface for NpcMind.
 
 Provides process health reporting, a stateless behavior-tree evaluator, a
-single-step finite-state-machine driver, and one-shot goal-oriented action
-planning. Each ``evaluate_behavior`` call executes exactly one tick of the
-supplied tree against the supplied blackboard; each ``step_state_machine``
-call advances a machine by exactly one event; each ``plan_goap`` call
-searches for a minimum-cost action sequence from the supplied world state
-to the supplied goal. No state is kept between calls.
+single-step finite-state-machine driver, one-shot goal-oriented action
+planning, and a stateless two-dimensional grid path search. Each
+``evaluate_behavior`` call executes exactly one tick of the supplied tree
+against the supplied blackboard; each ``step_state_machine`` call advances a
+machine by exactly one event; each ``plan_goap`` call searches for a
+minimum-cost action sequence from the supplied world state to the supplied
+goal; each ``find_path`` call searches a supplied grid for a minimum-cost
+four-neighbour route. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -35,6 +37,10 @@ class MachineError(ValueError):
 
 class GoapError(ValueError):
     """Raised when a GOAP planning request fails validation."""
+
+
+class NavigationError(ValueError):
+    """Raised when a navigation request fails structural validation."""
 
 
 def _is_valid_key(key: Any) -> bool:
@@ -284,8 +290,21 @@ def _goap_conditions_met(conditions: dict, state: dict) -> bool:
     return all(key in state and _json_equal(state[key], value) for key, value in conditions.items())
 
 
+def _validate_nav_coordinate(coord: Any, where: str) -> tuple[int, int]:
+    """Validate a grid coordinate object; return its (x, y) tuple."""
+    if not isinstance(coord, dict):
+        raise NavigationError(f"{where} must be an object")
+    if "x" not in coord or "y" not in coord:
+        raise NavigationError(f"{where} requires integer x and y")
+    x = coord["x"]
+    y = coord["y"]
+    if isinstance(x, bool) or not isinstance(x, int) or isinstance(y, bool) or not isinstance(y, int):
+        raise NavigationError(f"{where} requires integer x and y")
+    return x, y
+
+
 class Service:
-    """Health, behavior-tree evaluation, FSM stepping, GOAP planning."""
+    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation."""
     name = "npcmind"
     version = __version__
 
@@ -471,3 +490,83 @@ class Service:
                 counter += 1
                 heapq.heappush(heap, (next_cost, next_positions, counter, next_key, next_state))
         return {"status": "UNREACHABLE", "plan": [], "cost": None, "final_world": start}
+
+    def find_path(self, request: Any) -> dict:
+        """Find a minimum-cost four-neighbour route through ``grid``.
+
+        The request is validated in full before any search happens. The grid
+        must be a non-empty rectangular list whose cells are either ``None``
+        (impassable) or a positive integer giving the cost of entering that
+        cell; ``start`` and ``goal`` must be objects with integer ``x`` and
+        ``y`` fields inside the grid on passable cells. The returned route
+        minimises total cost (the start cell costs nothing); ties are broken
+        by comparing the full (y, x) coordinate sequences lexicographically
+        and choosing the smallest. A start equal to its goal yields the
+        single-point path at zero cost, and an unreachable goal is not an
+        error. Raises ValueError (NavigationError) on any invalid input; the
+        request is never mutated and no map or search state is retained.
+        """
+        if not isinstance(request, dict):
+            raise NavigationError("request must be a JSON object")
+        if "grid" not in request or "start" not in request or "goal" not in request:
+            raise NavigationError("request requires grid, start and goal")
+        grid = request["grid"]
+        if not isinstance(grid, list) or not grid:
+            raise NavigationError("grid must be a non-empty two-dimensional array")
+        width = len(grid[0]) if isinstance(grid[0], list) else -1
+        if width <= 0:
+            raise NavigationError("grid must be a non-empty two-dimensional array")
+        for row in grid:
+            if not isinstance(row, list) or len(row) != width:
+                raise NavigationError("grid must be a non-empty rectangular array")
+            for cell in row:
+                if cell is not None and (isinstance(cell, bool) or not isinstance(cell, int) or cell <= 0):
+                    raise NavigationError("grid cells must be null or positive integers")
+
+        start_x, start_y = _validate_nav_coordinate(request["start"], "start")
+        goal_x, goal_y = _validate_nav_coordinate(request["goal"], "goal")
+        height = len(grid)
+        for name, x, y in (("start", start_x, start_y), ("goal", goal_x, goal_y)):
+            if not (0 <= x < width and 0 <= y < height):
+                raise NavigationError(f"{name} is outside the grid")
+            if grid[y][x] is None:
+                raise NavigationError(f"{name} must be on a passable cell")
+
+        if start_x == goal_x and start_y == goal_y:
+            return {"status": "SUCCESS", "path": [{"x": start_x, "y": start_y}], "cost": 0}
+
+        # Dijkstra with the full (y, x) cell sequence carried in the heap
+        # priority: equal-cost routes are resolved lexicographically by
+        # their coordinate sequences, so the first time the goal is popped it
+        # carries the uniquely-determined minimum route.
+        start_seq = ((start_y, start_x),)
+        distances: dict[tuple[int, int], int] = {(start_y, start_x): 0}
+        heap: list[tuple[int, tuple[tuple[int, int], ...], int]] = []
+        counter = 0
+        heapq.heappush(heap, (0, start_seq, counter))
+        while heap:
+            cost, seq, _ = heapq.heappop(heap)
+            y, x = seq[-1]
+            if distances.get((y, x)) != cost:
+                continue  # stale entry superseded by a better path
+            if (y, x) == (goal_y, goal_x):
+                return {
+                    "status": "SUCCESS",
+                    "path": [{"x": cell_x, "y": cell_y} for cell_y, cell_x in seq],
+                    "cost": cost,
+                }
+            for next_y, next_x in ((y - 1, x), (y, x - 1), (y, x + 1), (y + 1, x)):
+                if not (0 <= next_y < height and 0 <= next_x < width):
+                    continue
+                cell_cost = grid[next_y][next_x]
+                if cell_cost is None:
+                    continue
+                next_cost = cost + cell_cost
+                known = distances.get((next_y, next_x))
+                next_seq = seq + ((next_y, next_x),)
+                if known is not None and known <= next_cost:
+                    continue
+                distances[(next_y, next_x)] = next_cost
+                counter += 1
+                heapq.heappush(heap, (next_cost, next_seq, counter))
+        return {"status": "UNREACHABLE", "path": [], "cost": None}
