@@ -8,7 +8,9 @@ blackboard; each ``step_state_machine`` call advances a machine by exactly
 one event; each ``plan_goap`` call searches for a minimum-cost action
 sequence from the supplied world state to the supplied goal; each
 ``find_path`` call searches a one-shot grid request for a minimum-cost
-orthogonal route. No state is kept between calls.
+orthogonal route; each ``select_utility`` call scores the supplied options
+against the supplied context once and picks the best. No state is kept
+between calls.
 """
 
 from __future__ import annotations
@@ -41,6 +43,38 @@ class GoapError(ValueError):
 
 class NavigationError(ValueError):
     """Raised when a navigation request fails validation."""
+
+
+class UtilityError(ValueError):
+    """Raised when a utility-selection request fails validation."""
+
+
+_UTILITY_CURVES = ("linear", "inverse")
+
+
+def _is_finite_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+
+
+def _validate_utility_consideration(consideration: Any, where: str) -> None:
+    if not isinstance(consideration, dict):
+        raise UtilityError(f"{where} must be an object")
+    if not _is_valid_key(consideration.get("key")):
+        raise UtilityError(f"{where} requires a non-empty string key")
+    low = consideration.get("min")
+    high = consideration.get("max")
+    if not _is_finite_number(low):
+        raise UtilityError(f"{where}: min must be a finite number")
+    if not _is_finite_number(high):
+        raise UtilityError(f"{where}: max must be a finite number")
+    if not low < high:
+        raise UtilityError(f"{where}: min must be less than max")
+    curve = consideration.get("curve")
+    if curve not in _UTILITY_CURVES:
+        raise UtilityError(f"{where}: unknown curve {curve!r}")
+    weight = consideration.get("weight", 1)
+    if not _is_finite_number(weight) or weight <= 0:
+        raise UtilityError(f"{where}: weight must be a positive finite number")
 
 
 _NAV_NEIGHBORS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -331,7 +365,7 @@ def _goap_conditions_met(conditions: dict, state: dict) -> bool:
 
 
 class Service:
-    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation."""
+    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation, utility."""
     name = "npcmind"
     version = __version__
 
@@ -592,3 +626,110 @@ class Service:
                 counter += 1
                 heapq.heappush(heap, (next_cost, next_sequence, counter, nx, ny))
         return {"status": "UNREACHABLE", "path": [], "cost": None}
+
+    def select_utility(self, request: Any) -> dict:
+        """Score each enabled option and select the highest-scoring one.
+
+        The request is validated in full before any scoring happens. Every
+        option requires a unique non-empty string ``id``; ``enabled``
+        (default ``True``), ``base`` (default ``1``, a non-negative finite
+        number) and ``considerations`` (default ``[]``) may be omitted. Each
+        consideration names a ``context`` key, a finite ``min``/``max`` range
+        with ``min < max``, a ``curve`` of ``linear`` or ``inverse``, and an
+        optional positive finite ``weight`` (default ``1``). The context value
+        is normalised to ``(value - min) / (max - min)`` clamped to ``[0, 1]``;
+        ``linear`` uses that value and ``inverse`` uses one minus it. An
+        enabled option's score is its ``base`` times the weight-averaged
+        responses (just ``base`` when it has no considerations). The highest
+        score wins; ties go to the option appearing first in ``options``.
+        Disabled options are validated structurally but never scored and
+        never require their context keys to exist. When every option is
+        disabled the result is ``NO_SELECTION`` with null ``selected`` and
+        ``score`` — not an error. Raises ValueError (UtilityError) on any
+        invalid input; the request is never mutated and no state is kept
+        between calls.
+        """
+        if not isinstance(request, dict):
+            raise UtilityError("request must be a JSON object")
+        context = request.get("context")
+        if not isinstance(context, dict):
+            raise UtilityError("context must be an object")
+        for key, value in context.items():
+            if not _is_valid_key(key):
+                raise UtilityError(f"context key {key!r} must be a non-empty string")
+            if not _is_finite_number(value):
+                raise UtilityError(f"context[{key!r}] must be a finite number")
+        options = request.get("options")
+        if not isinstance(options, list) or not options:
+            raise UtilityError("options must be a non-empty list")
+
+        parsed_options: list[tuple[str, bool, float, list]] = []
+        seen_ids: set[str] = set()
+        for index, option in enumerate(options):
+            where = f"option at options[{index}]"
+            if not isinstance(option, dict):
+                raise UtilityError(f"{where} must be an object")
+            option_id = option.get("id")
+            if not _is_valid_key(option_id):
+                raise UtilityError(f"{where} requires a non-empty string id")
+            if option_id in seen_ids:
+                raise UtilityError(f"duplicate option id {option_id!r}")
+            seen_ids.add(option_id)
+            where = f"option {option_id!r}"
+            enabled = option.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise UtilityError(f"{where}: enabled must be a boolean")
+            base = option.get("base", 1)
+            if not _is_finite_number(base) or base < 0:
+                raise UtilityError(f"{where}: base must be a non-negative finite number")
+            considerations = option.get("considerations", [])
+            if not isinstance(considerations, list):
+                raise UtilityError(f"{where}: considerations must be a list")
+            for c_index, consideration in enumerate(considerations):
+                _validate_utility_consideration(
+                    consideration, f"{where} consideration at considerations[{c_index}]"
+                )
+            if enabled:
+                for consideration in considerations:
+                    key = consideration["key"]
+                    if key not in context:
+                        raise UtilityError(f"{where}: context is missing key {key!r}")
+            parsed_options.append((option_id, enabled, base, considerations))
+
+        details: list[dict] = []
+        selected: str | None = None
+        selected_score: float | None = None
+        for option_id, enabled, base, considerations in parsed_options:
+            if not enabled:
+                details.append(
+                    {"id": option_id, "enabled": False, "score": None, "considerations": []}
+                )
+                continue
+            responses: list[dict] = []
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for consideration in considerations:
+                key = consideration["key"]
+                value = context[key]
+                low = consideration["min"]
+                high = consideration["max"]
+                normalised = (value - low) / (high - low)
+                normalised = min(max(normalised, 0.0), 1.0)
+                response = normalised if consideration["curve"] == "linear" else 1.0 - normalised
+                weight = consideration.get("weight", 1)
+                weighted_sum += response * weight
+                weight_total += weight
+                responses.append(
+                    {"key": key, "value": value, "response": response, "weight": weight}
+                )
+            score = base * (weighted_sum / weight_total) if responses else base
+            details.append(
+                {"id": option_id, "enabled": True, "score": score, "considerations": responses}
+            )
+            if selected_score is None or score > selected_score:
+                selected = option_id
+                selected_score = score
+
+        if selected is None:
+            return {"status": "NO_SELECTION", "selected": None, "score": None, "options": details}
+        return {"status": "SELECTED", "selected": selected, "score": selected_score, "options": details}
