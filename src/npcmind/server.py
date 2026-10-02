@@ -10,6 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .service import Service
 
 
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value!r}")
+
+
 def env_address() -> tuple[str, int]:
     raw = os.environ.get("NPCMIND_ADDR", "127.0.0.1:8080")
     host, _, port = raw.rpartition(":")
@@ -34,6 +38,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, self.service.health())
             return
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+
+    def do_POST(self) -> None:
+        if self.path != "/v1/behavior-trees/evaluate":
+            self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(max(length, 0))
+        try:
+            request = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        except ValueError as exc:
+            self.send_json(400, {"error": {"code": "invalid_json", "message": f"request body is not valid JSON: {exc}"}})
+            return
+        try:
+            result = self.service.evaluate_behavior(request)
+        except ValueError as exc:
+            self.send_json(422, {"error": {"code": "invalid_tree", "message": str(exc)}})
+            return
+        self.send_json(200, result)
 
     def log_message(self, fmt: str, *args: object) -> None:
         """Silence per-request logging so recorded output stays stable."""
