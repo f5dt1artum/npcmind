@@ -1,14 +1,19 @@
 """Core service surface for NpcMind.
 
-Provides process health reporting, a stateless behavior-tree evaluator, and
-a single-step finite-state-machine driver. Each ``evaluate_behavior`` call
-executes exactly one tick of the supplied tree against the supplied
-blackboard; each ``step_state_machine`` call advances a machine by exactly
-one event. No state is kept between calls.
+Provides process health reporting, a stateless behavior-tree evaluator,
+a single-step finite-state-machine driver, and one-shot goal-oriented
+action planning. Each ``evaluate_behavior`` call executes exactly one tick
+of the supplied tree against the supplied blackboard; each
+``step_state_machine`` call advances a machine by exactly one event; each
+``plan_goap`` call searches once for a minimum-cost action sequence. No
+state is kept between calls.
 """
 
 from __future__ import annotations
 
+import copy
+import heapq
+import math
 from typing import Any
 
 from . import __version__
@@ -25,6 +30,10 @@ class TreeError(ValueError):
 
 class MachineError(ValueError):
     """Raised when a state-machine request fails structural validation."""
+
+
+class GoapError(ValueError):
+    """Raised when a GOAP planning request fails structural validation."""
 
 
 def _is_valid_key(key: Any) -> bool:
@@ -222,8 +231,99 @@ def _sm_condition_holds(condition: dict | None, blackboard: dict) -> bool:
     return not _json_equal(blackboard[key], condition["value"])  # not_equals
 
 
+def _validate_json_value(value: Any, path: str) -> None:
+    """Reject anything that is not a finite, JSON-representable value."""
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise GoapError(f"value at {path} must be a finite number")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise GoapError(f"key {key!r} at {path} must be a string")
+            _validate_json_value(item, f"{path}.{key}")
+        return
+    raise GoapError(f"value at {path} is not a valid JSON value")
+
+
+def _validate_state_object(state: Any, name: str) -> None:
+    if not isinstance(state, dict):
+        raise GoapError(f"{name} must be an object")
+    for key in state:
+        if not _is_valid_key(key):
+            raise GoapError(f"{name} key {key!r} must be a non-empty string")
+    for key, value in state.items():
+        _validate_json_value(value, f"{name}.{key}")
+
+
+def _validate_goap_actions(actions: Any) -> list[tuple[str, int, dict, dict]]:
+    """Validate the action list fully; return normalized action tuples."""
+    if not isinstance(actions, list):
+        raise GoapError("actions must be a list")
+    seen_ids: set[str] = set()
+    normalized: list[tuple[str, int, dict, dict]] = []
+    for index, action in enumerate(actions):
+        where = f"action at actions[{index}]"
+        if not isinstance(action, dict):
+            raise GoapError(f"{where} must be an object")
+        action_id = action.get("id")
+        if not _is_valid_key(action_id):
+            raise GoapError(f"{where} requires a non-empty string id")
+        if action_id in seen_ids:
+            raise GoapError(f"duplicate action id {action_id!r}")
+        seen_ids.add(action_id)
+        where = f"action {action_id!r}"
+
+        cost = action.get("cost", 1)
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost <= 0:
+            raise GoapError(f"{where}: cost must be a positive integer")
+
+        preconditions = action.get("preconditions", {})
+        effects = action.get("effects", {})
+        for field_name, field in (("preconditions", preconditions), ("effects", effects)):
+            if not isinstance(field, dict):
+                raise GoapError(f"{where}: {field_name} must be an object")
+            for key in field:
+                if not _is_valid_key(key):
+                    raise GoapError(f"{where}: {field_name} key {key!r} must be a non-empty string")
+            for key, value in field.items():
+                _validate_json_value(value, f"{where}.{field_name}.{key}")
+        normalized.append((action_id, cost, preconditions, effects))
+    return normalized
+
+
+def _conditions_met(conditions: dict, state: dict) -> bool:
+    """Every condition key must exist in ``state`` with an equal value."""
+    return all(key in state and _json_equal(state[key], value) for key, value in conditions.items())
+
+
+def _freeze_state_value(value: Any) -> Any:
+    """Hashable canonical form honoring ``_json_equal`` semantics."""
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (int, float)):
+        return ("num", value)
+    if isinstance(value, str):
+        return ("str", value)
+    if value is None:
+        return ("none",)
+    if isinstance(value, list):
+        return ("list", tuple(_freeze_state_value(item) for item in value))
+    return ("dict", tuple(sorted((key, _freeze_state_value(item)) for key, item in value.items())))
+
+
+def _freeze_state(state: dict) -> tuple:
+    return tuple(sorted((key, _freeze_state_value(value)) for key, value in state.items()))
+
+
 class Service:
-    """Health reporting, stateless behavior-tree evaluation, FSM stepping."""
+    """Health reporting, stateless behavior-tree evaluation, FSM stepping, GOAP planning."""
 
     name = "npcmind"
     version = __version__
@@ -319,4 +419,63 @@ class Service:
             "transition": matched["id"],
             "blackboard": board,
             "trace": trace,
+        }
+
+    def plan_goap(self, request: dict) -> dict:
+        """Find a minimum-cost action sequence reaching ``request['goal']``.
+
+        The request is validated in full before any search runs. A uniform
+        cost search over world states applies an action only when every
+        precondition key exists with an equal value; effects overwrite their
+        keys and leave the rest of the state untouched. Among plans of equal
+        total cost, the one whose sequence of action positions in the input
+        list is lexicographically smallest wins. Raises ValueError
+        (GoapError) on any structural problem; the request and its nested
+        objects are never mutated.
+        """
+        if not isinstance(request, dict):
+            raise GoapError("request must be a JSON object")
+        _validate_state_object(request.get("world"), "world")
+        _validate_state_object(request.get("goal"), "goal")
+        world = request["world"]
+        goal = request["goal"]
+        actions = _validate_goap_actions(request.get("actions"))
+
+        # Heap entries are (total_cost, index_sequence, counter, state, plan);
+        # ordering by (cost, sequence) yields the cheapest plan first and
+        # breaks cost ties by lexicographic action-position order.
+        start = copy.deepcopy(dict(world))
+        heap: list = [(0, (), 0, start, [])]
+        visited: set = set()
+        counter = 0
+        while heap:
+            cost, _seq, _, state, plan = heapq.heappop(heap)
+            frozen = _freeze_state(state)
+            if frozen in visited:
+                continue
+            visited.add(frozen)
+            if _conditions_met(goal, state):
+                return {
+                    "status": "SUCCESS",
+                    "plan": [actions[index][0] for index in plan],
+                    "cost": cost,
+                    "final_world": state,
+                }
+            for index, (_action_id, action_cost, preconditions, effects) in enumerate(actions):
+                if not _conditions_met(preconditions, state):
+                    continue
+                next_state = dict(state)
+                for key, value in effects.items():
+                    next_state[key] = copy.deepcopy(value)
+                counter += 1
+                heapq.heappush(
+                    heap,
+                    (cost + action_cost, _seq + (index,), counter, next_state, plan + [index]),
+                )
+
+        return {
+            "status": "UNREACHABLE",
+            "plan": [],
+            "cost": None,
+            "final_world": copy.deepcopy(dict(world)),
         }
