@@ -1,12 +1,14 @@
 """Core service surface for NpcMind.
 
 Provides process health reporting, a stateless behavior-tree evaluator, a
-single-step finite-state-machine driver, and one-shot goal-oriented action
-planning. Each ``evaluate_behavior`` call executes exactly one tick of the
-supplied tree against the supplied blackboard; each ``step_state_machine``
-call advances a machine by exactly one event; each ``plan_goap`` call
-searches for a minimum-cost action sequence from the supplied world state
-to the supplied goal. No state is kept between calls.
+single-step finite-state-machine driver, one-shot goal-oriented action
+planning, and stateless 2D grid navigation. Each ``evaluate_behavior`` call
+executes exactly one tick of the supplied tree against the supplied
+blackboard; each ``step_state_machine`` call advances a machine by exactly
+one event; each ``plan_goap`` call searches for a minimum-cost action
+sequence from the supplied world state to the supplied goal; each
+``find_path`` call searches a one-shot grid request for a minimum-cost
+orthogonal route. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -35,6 +37,50 @@ class MachineError(ValueError):
 
 class GoapError(ValueError):
     """Raised when a GOAP planning request fails validation."""
+
+
+class NavigationError(ValueError):
+    """Raised when a navigation request fails validation."""
+
+
+_NAV_NEIGHBORS = ((0, -1), (0, 1), (-1, 0), (1, 0))
+
+
+def _validate_nav_grid(grid: Any) -> tuple[int, int]:
+    """Validate a non-empty rectangular grid of null/positive-int cells.
+
+    Returns ``(width, height)``.
+    """
+    if not isinstance(grid, list) or not grid:
+        raise NavigationError("grid must be a non-empty rectangular 2D array")
+    first = grid[0]
+    if not isinstance(first, list) or not first:
+        raise NavigationError("grid must be a non-empty rectangular 2D array")
+    width = len(first)
+    for row in grid:
+        if not isinstance(row, list) or len(row) != width:
+            raise NavigationError("grid must be a non-empty rectangular 2D array")
+        for cell in row:
+            if cell is None:
+                continue
+            if isinstance(cell, bool) or not isinstance(cell, int) or cell <= 0:
+                raise NavigationError("grid cells must be null or positive integers")
+    return width, len(grid)
+
+
+def _validate_nav_coordinate(value: Any, where: str) -> tuple[int, int]:
+    """Validate ``{"x": int, "y": int}``; booleans are not integers."""
+    if not isinstance(value, dict):
+        raise NavigationError(f"{where} must be an object")
+    if "x" not in value or "y" not in value:
+        raise NavigationError(f"{where} requires integer fields x and y")
+    x = value["x"]
+    y = value["y"]
+    if isinstance(x, bool) or not isinstance(x, int):
+        raise NavigationError(f"{where}.x must be an integer")
+    if isinstance(y, bool) or not isinstance(y, int):
+        raise NavigationError(f"{where}.y must be an integer")
+    return x, y
 
 
 def _is_valid_key(key: Any) -> bool:
@@ -285,7 +331,7 @@ def _goap_conditions_met(conditions: dict, state: dict) -> bool:
 
 
 class Service:
-    """Health, behavior-tree evaluation, FSM stepping, GOAP planning."""
+    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation."""
     name = "npcmind"
     version = __version__
 
@@ -471,3 +517,78 @@ class Service:
                 counter += 1
                 heapq.heappush(heap, (next_cost, next_positions, counter, next_key, next_state))
         return {"status": "UNREACHABLE", "plan": [], "cost": None, "final_world": start}
+
+    def find_path(self, request: Any) -> dict:
+        """Find the minimum-cost orthogonal path from ``start`` to ``goal``.
+
+        The request is validated in full before any search happens. The grid
+        is a non-empty rectangular array whose cells are either ``None``
+        (impassable) or a positive integer giving the cost of entering that
+        cell; coordinates use integer ``x``/``y`` fields with the origin at
+        the top-left corner and movement restricted to the four orthogonal
+        neighbours. The start cell itself costs nothing. The returned route
+        minimises total cost; ties are broken by converting each route to its
+        full sequence of ``(y, x)`` coordinates and choosing the
+        lexicographically smallest. Raises ValueError (NavigationError) on
+        any invalid input; the request is never mutated and no grid or search
+        state is retained between calls.
+        """
+        if not isinstance(request, dict):
+            raise NavigationError("request must be a JSON object")
+        if "grid" not in request:
+            raise NavigationError("request is missing 'grid'")
+        if "start" not in request:
+            raise NavigationError("request is missing 'start'")
+        if "goal" not in request:
+            raise NavigationError("request is missing 'goal'")
+        width, height = _validate_nav_grid(request["grid"])
+        start = _validate_nav_coordinate(request["start"], "start")
+        goal = _validate_nav_coordinate(request["goal"], "goal")
+        grid = request["grid"]
+        for x, y, where in ((start[0], start[1], "start"), (goal[0], goal[1], "goal")):
+            if not (0 <= x < width and 0 <= y < height):
+                raise NavigationError(f"{where} is outside the grid")
+            if grid[y][x] is None:
+                raise NavigationError(f"{where} must be on a passable cell")
+
+        if start == goal:
+            return {
+                "status": "SUCCESS",
+                "path": [{"x": start[0], "y": start[1]}],
+                "cost": 0,
+            }
+
+        # Dijkstra over (cost, node sequence); the sequence key is a tuple of
+        # (y, x) coordinates, so equal-cost routes tie-break lexicographically
+        # by y then x as required.
+        sx, sy = start
+        gx, gy = goal
+        best: dict[tuple[int, int], tuple[int, tuple]] = {(sx, sy): (0, ())}
+        heap: list[tuple[int, tuple, int, int, int]] = [(0, (), 0, sx, sy)]
+        counter = 0
+        while heap:
+            cost, sequence, _, x, y = heapq.heappop(heap)
+            if best.get((x, y)) != (cost, sequence):
+                continue  # stale entry superseded by a better route
+            if (x, y) == (gx, gy):
+                return {
+                    "status": "SUCCESS",
+                    "path": [{"x": px, "y": py} for py, px in ((sy, sx),) + sequence],
+                    "cost": cost,
+                }
+            for dx, dy in _NAV_NEIGHBORS:
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+                enter_cost = grid[ny][nx]
+                if enter_cost is None:
+                    continue
+                next_cost = cost + enter_cost
+                next_sequence = sequence + ((ny, nx),)
+                known = best.get((nx, ny))
+                if known is not None and known <= (next_cost, next_sequence):
+                    continue
+                best[(nx, ny)] = (next_cost, next_sequence)
+                counter += 1
+                heapq.heappush(heap, (next_cost, next_sequence, counter, nx, ny))
+        return {"status": "UNREACHABLE", "path": [], "cost": None}

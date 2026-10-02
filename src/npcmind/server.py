@@ -28,6 +28,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/behavior-trees/evaluate": ("evaluate_behavior", "invalid_tree"),
         "/v1/state-machines/step": ("step_state_machine", "invalid_state_machine"),
         "/v1/goap/plan": ("plan_goap", "invalid_goap"),
+        "/v1/navigation/path": ("find_path", "invalid_navigation"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:
