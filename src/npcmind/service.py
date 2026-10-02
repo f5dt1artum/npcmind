@@ -2,13 +2,15 @@
 
 Provides process health reporting, a stateless behavior-tree evaluator, a
 single-step finite-state-machine driver, one-shot goal-oriented action
-planning, and stateless 2D grid navigation. Each ``evaluate_behavior`` call
+planning, stateless 2D grid navigation, and one-shot utility-based
+selection. Each ``evaluate_behavior`` call
 executes exactly one tick of the supplied tree against the supplied
 blackboard; each ``step_state_machine`` call advances a machine by exactly
 one event; each ``plan_goap`` call searches for a minimum-cost action
 sequence from the supplied world state to the supplied goal; each
 ``find_path`` call searches a one-shot grid request for a minimum-cost
-orthogonal route. No state is kept between calls.
+orthogonal route; each ``select_utility`` call scores the supplied options
+against the supplied context exactly once. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -41,6 +43,10 @@ class GoapError(ValueError):
 
 class NavigationError(ValueError):
     """Raised when a navigation request fails validation."""
+
+
+class UtilityError(ValueError):
+    """Raised when a utility-selection request fails validation."""
 
 
 _NAV_NEIGHBORS = ((0, -1), (0, 1), (-1, 0), (1, 0))
@@ -85,6 +91,14 @@ def _validate_nav_coordinate(value: Any, where: str) -> tuple[int, int]:
 
 def _is_valid_key(key: Any) -> bool:
     return isinstance(key, str) and key != ""
+
+
+_UTILITY_CURVES = ("linear", "inverse")
+
+
+def _is_finite_number(value: Any) -> bool:
+    """True for finite int/float; booleans are not numbers."""
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
 
 
 def _json_equal(a: Any, b: Any) -> bool:
@@ -592,3 +606,136 @@ class Service:
                 counter += 1
                 heapq.heappush(heap, (next_cost, next_sequence, counter, nx, ny))
         return {"status": "UNREACHABLE", "path": [], "cost": None}
+
+    def select_utility(self, request: Any) -> dict:
+        """Score the enabled options against ``context`` and pick the best.
+
+        The request is validated in full before any scoring happens. Each
+        option carries a unique non-empty string ``id`` plus optional
+        ``enabled`` (default ``True``), ``base`` (default ``1``, a
+        non-negative finite number) and ``considerations`` (default ``[]``).
+        Each consideration references a ``context`` key and maps its value
+        through a ``linear`` or ``inverse`` curve over the finite range
+        ``[min, max]`` (``min < max``), clamped to ``[0, 1]``; an option's
+        score is its ``base`` times the ``weight``-weighted average of the
+        consideration responses (``weight`` defaults to ``1`` and must be a
+        positive finite number), or just ``base`` when it declares no
+        considerations. The highest-scoring enabled option wins; ties go to
+        the earliest option in the input. Disabled options are still
+        validated structurally but their context keys need not exist, and
+        they report a ``null`` score with empty consideration details. When
+        every option is disabled the result is ``NO_SELECTION`` with null
+        ``selected``/``score`` — not an error. Raises ValueError
+        (UtilityError) on any invalid input; the request is never mutated
+        and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise UtilityError("request must be a JSON object")
+        context = request.get("context")
+        if not isinstance(context, dict):
+            raise UtilityError("context must be an object")
+        for key, value in context.items():
+            if not _is_valid_key(key):
+                raise UtilityError(f"context key {key!r} must be a non-empty string")
+            if not _is_finite_number(value):
+                raise UtilityError(f"context[{key!r}] must be a finite number")
+        options = request.get("options")
+        if not isinstance(options, list) or not options:
+            raise UtilityError("options must be a non-empty list")
+
+        parsed: list[tuple[str, bool, float, list]] = []
+        seen_ids: set[str] = set()
+        for index, option in enumerate(options):
+            where = f"option at options[{index}]"
+            if not isinstance(option, dict):
+                raise UtilityError(f"{where} must be an object")
+            option_id = option.get("id")
+            if not _is_valid_key(option_id):
+                raise UtilityError(f"{where} requires a non-empty string id")
+            if option_id in seen_ids:
+                raise UtilityError(f"duplicate option id {option_id!r}")
+            seen_ids.add(option_id)
+            where = f"option {option_id!r}"
+            enabled = option.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise UtilityError(f"{where}: enabled must be a boolean")
+            base = option.get("base", 1)
+            if not _is_finite_number(base) or base < 0:
+                raise UtilityError(f"{where}: base must be a non-negative finite number")
+            considerations = option.get("considerations", [])
+            if not isinstance(considerations, list):
+                raise UtilityError(f"{where}: considerations must be a list")
+            parsed_considerations: list[tuple[str, float, float, str, float]] = []
+            for c_index, consideration in enumerate(considerations):
+                c_where = f"{where}.considerations[{c_index}]"
+                if not isinstance(consideration, dict):
+                    raise UtilityError(f"{c_where} must be an object")
+                key = consideration.get("key")
+                if not _is_valid_key(key):
+                    raise UtilityError(f"{c_where} requires a non-empty string key")
+                for field in ("min", "max"):
+                    if field not in consideration:
+                        raise UtilityError(f"{c_where} requires {field!r}")
+                    if not _is_finite_number(consideration[field]):
+                        raise UtilityError(f"{c_where}: {field} must be a finite number")
+                minimum = consideration["min"]
+                maximum = consideration["max"]
+                if not minimum < maximum:
+                    raise UtilityError(f"{c_where}: min must be less than max")
+                curve = consideration.get("curve")
+                if curve not in _UTILITY_CURVES:
+                    raise UtilityError(f"{c_where}: unknown curve {curve!r}")
+                weight = consideration.get("weight", 1)
+                if not _is_finite_number(weight) or weight <= 0:
+                    raise UtilityError(f"{c_where}: weight must be a positive finite number")
+                if enabled and key not in context:
+                    raise UtilityError(
+                        f"{where}: consideration references missing context key {key!r}"
+                    )
+                parsed_considerations.append((key, minimum, maximum, curve, weight))
+            parsed.append((option_id, enabled, base, parsed_considerations))
+
+        candidates: list[dict] = []
+        best_id: str | None = None
+        best_score: float | None = None
+        for option_id, enabled, base, considerations in parsed:
+            if not enabled:
+                candidates.append(
+                    {"id": option_id, "enabled": False, "score": None, "considerations": []}
+                )
+                continue
+            details: list[dict] = []
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for key, minimum, maximum, curve, weight in considerations:
+                value = context[key]
+                normalized = (value - minimum) / (maximum - minimum)
+                normalized = min(1.0, max(0.0, normalized))
+                response = normalized if curve == "linear" else 1.0 - normalized
+                weighted_sum += response * weight
+                weight_total += weight
+                details.append(
+                    {"key": key, "value": value, "response": response, "weight": weight}
+                )
+            score = base * (weighted_sum / weight_total) if considerations else base
+            candidates.append(
+                {"id": option_id, "enabled": True, "score": score, "considerations": details}
+            )
+            # Strictly-greater keeps the earliest option on ties.
+            if best_score is None or score > best_score:
+                best_id = option_id
+                best_score = score
+
+        if best_id is None:
+            return {
+                "status": "NO_SELECTION",
+                "selected": None,
+                "score": None,
+                "candidates": candidates,
+            }
+        return {
+            "status": "SELECTED",
+            "selected": best_id,
+            "score": best_score,
+            "candidates": candidates,
+        }
