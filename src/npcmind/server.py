@@ -24,6 +24,10 @@ def env_address() -> tuple[str, int]:
 
 class Handler(BaseHTTPRequestHandler):
     service = Service()
+    post_routes = {
+        "/v1/behavior-trees/evaluate": ("evaluate_behavior", "invalid_tree"),
+        "/v1/state-machines/step": ("step_state_machine", "invalid_state_machine"),
+    }
 
     def send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
@@ -40,9 +44,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
 
     def do_POST(self) -> None:
-        if self.path != "/v1/behavior-trees/evaluate":
+        route = self.post_routes.get(self.path)
+        if route is None:
             self.send_json(404, {"error": {"code": "not_found", "message": f"no route for {self.path}"}})
             return
+        method_name, error_code = route
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -54,9 +60,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": {"code": "invalid_json", "message": f"request body is not valid JSON: {exc}"}})
             return
         try:
-            result = self.service.evaluate_behavior(request)
+            result = getattr(self.service, method_name)(request)
         except ValueError as exc:
-            self.send_json(422, {"error": {"code": "invalid_tree", "message": str(exc)}})
+            self.send_json(422, {"error": {"code": error_code, "message": str(exc)}})
             return
         self.send_json(200, result)
 
