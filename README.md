@@ -16,10 +16,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/state-machines/step` 将有限状态机推进一个事件：请求体为 `{"machine": ..., "event": "...", "current_state": "...", "blackboard": {...}}`（`current_state` 省略时取 `initial`，`blackboard` 省略视为空对象，传入对象不会被修改）。`machine` 需定义非空 `states`、`initial` 与有序 `transitions`；状态与迁移使用非空且唯一的字符串 id，迁移的 `from` / `to` 必须引用已声明状态。每次调用只处理一个字符串事件，按声明顺序考察 `from` 等于当前状态且 `event` 精确匹配的迁移，选中首个 `condition`（与行为树相同的 `exists` / `equals` / `not_equals` 语义，省略视为满足）成立的迁移，并顺序执行仅含 `set` / `delete` 的 `actions`。返回 `previous_state`、`state`、`transition`（未命中为 `null`）、`blackboard` 与按考察顺序记录候选 id 及条件结果的 `trace`；未命中时状态与黑板不变。机器与请求在执行动作前完整校验，非法时返回 422 `invalid_state_machine`，Python 侧等价入口 `Service.step_state_machine(request)` 抛出 `ValueError`。
 
+`POST /v1/goap/plan` 执行一次性目标导向行动规划：请求体为 `{"world": {...}, "goal": {...}, "actions": [...]}`，`world` 与 `goal` 为以非空字符串作键的 JSON 对象；每个行动含全局唯一的非空字符串 `id`、可省略的 `cost`（默认 1，仅允许正整数）、可省略的 `preconditions` 与 `effects`（省略视为空对象）。前置条件仅在当前状态存在同名键且值相等时成立；效果覆盖对应键，其余状态项保留；目标的全部键存在且相等即满足（世界可含额外键）。值比较沿用现有规则：布尔值不等于数字，整数与浮点数按数值比较，对象与数组递归比较。初始状态已满足目标时返回 `status` 为 `SUCCESS`、空 `plan`、`cost` 为 0 及原始 `final_world`；否则返回总成本最低的计划（`plan` 按执行顺序列出行动 id，`cost` 为总成本，`final_world` 为执行后状态），成本相同时按行动在输入列表中的位置序列作字典序比较并取最小者。目标不可达时返回 `status` 为 `UNREACHABLE`、空 `plan`、`cost` 为 `null` 及原始 `world` 作为 `final_world`。请求在搜索前完整校验，非法时返回 422 `invalid_goap`，Python 侧等价入口 `Service.plan_goap(request)` 抛出 `ValueError`；调用不保存跨请求状态，也不修改传入的请求及其嵌套对象。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值与有限状态机的单步推进；寻路等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进与一次性 GOAP 规划；寻路等能力仍留给后续任务从已冻结事实出发独立设计并验证。

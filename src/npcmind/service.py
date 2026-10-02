@@ -1,14 +1,20 @@
 """Core service surface for NpcMind.
 
-Provides process health reporting, a stateless behavior-tree evaluator, and
-a single-step finite-state-machine driver. Each ``evaluate_behavior`` call
-executes exactly one tick of the supplied tree against the supplied
-blackboard; each ``step_state_machine`` call advances a machine by exactly
-one event. No state is kept between calls.
+Provides process health reporting, a stateless behavior-tree evaluator, a
+single-step finite-state-machine driver, and one-shot goal-oriented action
+planning. Each ``evaluate_behavior`` call executes exactly one tick of the
+supplied tree against the supplied blackboard; each ``step_state_machine``
+call advances a machine by exactly one event; each ``plan_goap`` call
+searches for a minimum-cost action sequence from the supplied world state
+to the supplied goal. No state is kept between calls.
 """
 
 from __future__ import annotations
 
+import heapq
+import math
+from copy import deepcopy
+from fractions import Fraction
 from typing import Any
 
 from . import __version__
@@ -25,6 +31,10 @@ class TreeError(ValueError):
 
 class MachineError(ValueError):
     """Raised when a state-machine request fails structural validation."""
+
+
+class GoapError(ValueError):
+    """Raised when a GOAP planning request fails validation."""
 
 
 def _is_valid_key(key: Any) -> bool:
@@ -222,9 +232,60 @@ def _sm_condition_holds(condition: dict | None, blackboard: dict) -> bool:
     return not _json_equal(blackboard[key], condition["value"])  # not_equals
 
 
-class Service:
-    """Health reporting, stateless behavior-tree evaluation, FSM stepping."""
+def _validate_json_value(value: Any, where: str) -> None:
+    """Ensure ``value`` is a legal JSON value with no non-finite numbers."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise GoapError(f"{where}: non-finite number is not a legal JSON value")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(item, f"{where}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise GoapError(f"{where}: object key {key!r} must be a string")
+            _validate_json_value(item, f"{where}.{key}")
+        return
+    raise GoapError(f"{where}: {type(value).__name__} is not a legal JSON value")
 
+
+def _validate_goap_state(state: dict, where: str) -> None:
+    for key in state:
+        if not _is_valid_key(key):
+            raise GoapError(f"{where} key {key!r} must be a non-empty string")
+    for key, value in state.items():
+        _validate_json_value(value, f"{where}[{key!r}]")
+
+
+def _freeze_value(value: Any) -> tuple:
+    """Hashable canonical form honouring _json_equal (bool != number)."""
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, (int, float)):
+        return ("num", Fraction(value))
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, list):
+        return ("list", tuple(_freeze_value(item) for item in value))
+    return ("dict", tuple(sorted((key, _freeze_value(item)) for key, item in value.items())))
+
+
+def _freeze_state(state: dict) -> tuple:
+    return tuple(sorted((key, _freeze_value(value)) for key, value in state.items()))
+
+
+def _goap_conditions_met(conditions: dict, state: dict) -> bool:
+    return all(key in state and _json_equal(state[key], value) for key, value in conditions.items())
+
+
+class Service:
+    """Health, behavior-tree evaluation, FSM stepping, GOAP planning."""
     name = "npcmind"
     version = __version__
 
@@ -320,3 +381,93 @@ class Service:
             "blackboard": board,
             "trace": trace,
         }
+
+    def plan_goap(self, request: dict) -> dict:
+        """Find a minimum-cost action sequence from ``world`` to ``goal``.
+
+        The request is validated in full before any search happens. Actions
+        may only fire when every precondition key exists in the current
+        state with an equal value; their effects then overwrite the matching
+        keys while all other state entries are kept. The goal is satisfied
+        once every goal key exists with an equal value (extra state keys are
+        allowed). The returned plan minimises total cost; ties are broken
+        by comparing the sequences of action positions in the input list
+        lexicographically and choosing the smallest. Raises ValueError
+        (GoapError) on any invalid input; the request is never mutated.
+        """
+        if not isinstance(request, dict):
+            raise GoapError("request must be a JSON object")
+        world = request.get("world")
+        if not isinstance(world, dict):
+            raise GoapError("world must be an object")
+        goal = request.get("goal")
+        if not isinstance(goal, dict):
+            raise GoapError("goal must be an object")
+        actions = request.get("actions")
+        if not isinstance(actions, list):
+            raise GoapError("actions must be a list")
+        _validate_goap_state(world, "world")
+        _validate_goap_state(goal, "goal")
+
+        parsed_actions: list[tuple[str, int, dict, dict]] = []
+        seen_ids: set[str] = set()
+        for index, action in enumerate(actions):
+            where = f"action at actions[{index}]"
+            if not isinstance(action, dict):
+                raise GoapError(f"{where} must be an object")
+            action_id = action.get("id")
+            if not _is_valid_key(action_id):
+                raise GoapError(f"{where} requires a non-empty string id")
+            if action_id in seen_ids:
+                raise GoapError(f"duplicate action id {action_id!r}")
+            seen_ids.add(action_id)
+            where = f"action {action_id!r}"
+            cost = action.get("cost", 1)
+            if isinstance(cost, bool) or not isinstance(cost, int) or cost <= 0:
+                raise GoapError(f"{where}: cost must be a positive integer")
+            preconditions = action.get("preconditions", {})
+            if not isinstance(preconditions, dict):
+                raise GoapError(f"{where}: preconditions must be an object")
+            effects = action.get("effects", {})
+            if not isinstance(effects, dict):
+                raise GoapError(f"{where}: effects must be an object")
+            _validate_goap_state(preconditions, f"{where} preconditions")
+            _validate_goap_state(effects, f"{where} effects")
+            parsed_actions.append((action_id, cost, preconditions, effects))
+
+        start = deepcopy(world)
+        # Uniform-cost search; the priority (cost, position sequence) pops
+        # the cheapest plan first and breaks cost ties lexicographically by
+        # the actions' positions in the input list.
+        heap: list[tuple[int, tuple[int, ...], int, tuple, dict]] = []
+        counter = 0
+        start_key = _freeze_state(start)
+        best: dict[tuple, tuple[int, tuple[int, ...]]] = {start_key: (0, ())}
+        heapq.heappush(heap, (0, (), counter, start_key, start))
+        while heap:
+            cost, positions, _, state_key, state = heapq.heappop(heap)
+            if best.get(state_key) != (cost, positions):
+                continue  # stale entry superseded by a better path
+            if _goap_conditions_met(goal, state):
+                return {
+                    "status": "SUCCESS",
+                    "plan": [parsed_actions[i][0] for i in positions],
+                    "cost": cost,
+                    "final_world": state,
+                }
+            for index, (_, action_cost, preconditions, effects) in enumerate(parsed_actions):
+                if not _goap_conditions_met(preconditions, state):
+                    continue
+                next_state = dict(state)
+                for key, value in effects.items():
+                    next_state[key] = deepcopy(value)
+                next_cost = cost + action_cost
+                next_positions = positions + (index,)
+                next_key = _freeze_state(next_state)
+                known = best.get(next_key)
+                if known is not None and known <= (next_cost, next_positions):
+                    continue
+                best[next_key] = (next_cost, next_positions)
+                counter += 1
+                heapq.heappush(heap, (next_cost, next_positions, counter, next_key, next_state))
+        return {"status": "UNREACHABLE", "plan": [], "cost": None, "final_world": start}

@@ -27,6 +27,7 @@ class Handler(BaseHTTPRequestHandler):
     post_routes = {
         "/v1/behavior-trees/evaluate": ("evaluate_behavior", "invalid_tree"),
         "/v1/state-machines/step": ("step_state_machine", "invalid_state_machine"),
+        "/v1/goap/plan": ("plan_goap", "invalid_goap"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:
