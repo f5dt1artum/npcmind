@@ -20,10 +20,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/navigation/path` 执行一次性二维方格寻路：请求体为 `{"grid": [[...]], "start": {"x": 0, "y": 0}, "goal": {"x": 2, "y": 1}}`。`grid` 是非空矩形二维数组，每格只能是 `null`（不可通行）或正整数（进入该格的代价，布尔值不视为整数）；坐标以左上角为原点，`x` 向右、`y` 向下，移动仅允许上下左右相邻的可通行格。成功时返回 `status` 为 `SUCCESS`、包含两端点且按移动顺序排列的 `path`（每个元素为同样的 `x`/`y` 坐标对象），以及不计起点、按进入后续格代价累加的 `cost`。结果选择总成本最低的路线；多条路线成本相同时，将每条路线转换为按行列坐标组成的完整序列，并按各坐标的 `y`、`x` 顺序作字典序比较，返回最小者。起点等于终点时返回只含该点的 `path` 和 0 成本；目标不可达不是请求错误，返回 `status` 为 `UNREACHABLE`、空 `path` 与 `null` 成本。请求在搜索前完整校验：请求或坐标不是对象、`grid` 为空或不规则、格值不合法、坐标字段缺失或含布尔值、坐标越界、起点或终点落在不可通行格上，均返回 422 `invalid_navigation`，Python 侧等价入口 `Service.find_path(request)` 抛出 `ValueError`，且不返回部分路线；调用不保存跨请求地图或搜索状态，也不修改传入的请求及其嵌套值。
 
+`POST /v1/perception/memory` 执行一次性感知记忆更新：请求体为 `{"now": 10.0, "retention": 5.0, "memory": [...], "observations": [...]}`（`memory` 与 `observations` 省略时视为空数组，传入对象不会被修改）。`now` 是非负有限数，`retention` 是正有限数。实体含全局唯一的非空字符串 `id`、非空字符串 `kind`、零到一之间的 `confidence`、含有限数 `x`/`y` 的 `position`，以及可省略的 JSON 对象 `data`（省略视为空对象）；`memory` 中的记录还需含不晚于 `now` 的非负有限数 `last_seen`，`observations` 不含 `last_seen`。合并先完整校验再按 `id` 进行：已有实体再次被观察时，用 observation 替换其 `kind`、`confidence`、`position` 与 `data`，把 `last_seen` 设为 `now`，并保留其在旧记忆中的位置；新实体按 observations 的顺序追加。未被观察的旧记录在 `now - last_seen` 大于或等于 `retention` 时删除，否则原样保留全部字段。返回 `status` 为 `UPDATED`、更新后的 `memory`（显式带有 `data`）、按观察输入顺序排列的 `seen` id 数组，以及按旧记忆顺序排列的 `forgotten` id 数组；重新观察的 id 不会出现在 `forgotten` 中。`memory` 内部或 `observations` 内部 id 重复、必填字段缺失、布尔值冒充数字、数值非有限、`confidence` 越界、`last_seen` 来自未来、`position` 非法或 `data` 含非 JSON 值时整体失败且不返回部分结果：HTTP 返回 422 `invalid_perception`，Python 侧等价入口 `Service.update_perception(request)` 抛出 `ValueError`；调用不保存跨请求状态，也不修改传入的请求及其嵌套对象。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划与无状态二维方格寻路；效用决策、避障、感知记忆等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、效用决策与一次性感知记忆更新；避障、对话意图和难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。

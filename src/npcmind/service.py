@@ -9,8 +9,10 @@ one event; each ``plan_goap`` call searches for a minimum-cost action
 sequence from the supplied world state to the supplied goal; each
 ``find_path`` call searches a one-shot grid request for a minimum-cost
 orthogonal route; each ``select_utility`` call scores the supplied options
-against the supplied context once and picks the best. No state is kept
-between calls.
+against the supplied context once and picks the best; each
+``update_perception`` call merges one batch of observations into the
+supplied memory snapshot and ages records out by retention. No state is
+kept between calls.
 """
 
 from __future__ import annotations
@@ -47,6 +49,10 @@ class NavigationError(ValueError):
 
 class UtilityError(ValueError):
     """Raised when a utility-selection request fails validation."""
+
+
+class PerceptionError(ValueError):
+    """Raised when a perception-memory request fails validation."""
 
 
 _UTILITY_CURVES = ("linear", "inverse")
@@ -364,8 +370,79 @@ def _goap_conditions_met(conditions: dict, state: dict) -> bool:
     return all(key in state and _json_equal(state[key], value) for key, value in conditions.items())
 
 
+def _validate_perception_json(value: Any, where: str) -> None:
+    """Ensure ``value`` is a legal JSON value with no non-finite numbers."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PerceptionError(f"{where}: non-finite number is not a legal JSON value")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_perception_json(item, f"{where}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PerceptionError(f"{where}: object key {key!r} must be a string")
+            _validate_perception_json(item, f"{where}.{key}")
+        return
+    raise PerceptionError(f"{where}: {type(value).__name__} is not a legal JSON value")
+
+
+def _validate_perception_entity(entity: Any, where: str, now: float, *, with_last_seen: bool) -> dict:
+    """Validate one memory record or observation fully; return a parsed copy."""
+    if not isinstance(entity, dict):
+        raise PerceptionError(f"{where} must be an object")
+    entity_id = entity.get("id")
+    if not _is_valid_key(entity_id):
+        raise PerceptionError(f"{where} requires a non-empty string id")
+    if "kind" not in entity:
+        raise PerceptionError(f"{where} is missing 'kind'")
+    kind = entity["kind"]
+    if not _is_valid_key(kind):
+        raise PerceptionError(f"{where}: kind must be a non-empty string")
+    last_seen = None
+    if with_last_seen:
+        if "last_seen" not in entity:
+            raise PerceptionError(f"{where} is missing 'last_seen'")
+        last_seen = entity["last_seen"]
+        if not _is_finite_number(last_seen) or last_seen < 0:
+            raise PerceptionError(f"{where}: last_seen must be a non-negative finite number")
+        if last_seen > now:
+            raise PerceptionError(f"{where}: last_seen must not be in the future")
+    if "confidence" not in entity:
+        raise PerceptionError(f"{where} is missing 'confidence'")
+    confidence = entity["confidence"]
+    if not _is_finite_number(confidence) or not 0 <= confidence <= 1:
+        raise PerceptionError(f"{where}: confidence must be a finite number between 0 and 1")
+    if "position" not in entity:
+        raise PerceptionError(f"{where} is missing 'position'")
+    position = entity["position"]
+    if not isinstance(position, dict) or "x" not in position or "y" not in position:
+        raise PerceptionError(f"{where}: position must be an object with finite fields x and y")
+    if not _is_finite_number(position["x"]) or not _is_finite_number(position["y"]):
+        raise PerceptionError(f"{where}: position.x and position.y must be finite numbers")
+    if "data" in entity:
+        data = entity["data"]
+        if not isinstance(data, dict):
+            raise PerceptionError(f"{where}: data must be an object")
+        _validate_perception_json(data, f"{where}.data")
+    parsed = {
+        "id": entity_id,
+        "kind": kind,
+        "confidence": confidence,
+        "position": {"x": position["x"], "y": position["y"]},
+        "data": deepcopy(entity["data"]) if "data" in entity else {},
+    }
+    if with_last_seen:
+        parsed["last_seen"] = last_seen
+    return parsed
+
+
 class Service:
-    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation, utility."""
+    """Health, behavior-tree evaluation, FSM stepping, GOAP, navigation, utility, perception."""
     name = "npcmind"
     version = __version__
 
@@ -733,3 +810,107 @@ class Service:
         if selected is None:
             return {"status": "NO_SELECTION", "selected": None, "score": None, "options": details}
         return {"status": "SELECTED", "selected": selected, "score": selected_score, "options": details}
+
+    def update_perception(self, request: Any) -> dict:
+        """Merge one batch of observations into a snapshot of memory.
+
+        The request is validated in full before anything is merged: ``now``
+        is a non-negative finite number, ``retention`` a positive finite
+        number, and ``memory``/``observations`` are lists of entities with
+        unique non-empty string ``id``, non-empty string ``kind``,
+        ``confidence`` in ``[0, 1]`` and a finite ``x``/``y`` position;
+        memory entities additionally carry a non-negative ``last_seen`` no
+        later than ``now``, and either may carry an optional JSON-object
+        ``data`` (omitted means ``{}``). Re-observed entities have their
+        kind/confidence/position/data replaced by the observation and their
+        ``last_seen`` set to ``now`` while keeping their position in the
+        memory order; new entities append in observation order. Unobserved
+        records with ``now - last_seen >= retention`` are forgotten; the
+        rest keep every field. Raises ValueError (PerceptionError) on any
+        invalid input; the request is never mutated and no state is kept
+        between calls.
+        """
+        if not isinstance(request, dict):
+            raise PerceptionError("request must be a JSON object")
+        if "now" not in request:
+            raise PerceptionError("request is missing 'now'")
+        now = request["now"]
+        if not _is_finite_number(now) or now < 0:
+            raise PerceptionError("now must be a non-negative finite number")
+        if "retention" not in request:
+            raise PerceptionError("request is missing 'retention'")
+        retention = request["retention"]
+        if not _is_finite_number(retention) or retention <= 0:
+            raise PerceptionError("retention must be a positive finite number")
+        memory = request.get("memory", [])
+        if not isinstance(memory, list):
+            raise PerceptionError("memory must be a list")
+        observations = request.get("observations", [])
+        if not isinstance(observations, list):
+            raise PerceptionError("observations must be a list")
+
+        records: list[dict] = []
+        memory_ids: set[str] = set()
+        for index, entity in enumerate(memory):
+            parsed = _validate_perception_entity(
+                entity, f"memory[{index}]", now, with_last_seen=True
+            )
+            if parsed["id"] in memory_ids:
+                raise PerceptionError(f"duplicate memory id {parsed['id']!r}")
+            memory_ids.add(parsed["id"])
+            records.append(parsed)
+
+        parsed_observations: list[dict] = []
+        observation_ids: set[str] = set()
+        for index, entity in enumerate(observations):
+            parsed = _validate_perception_entity(
+                entity, f"observations[{index}]", now, with_last_seen=False
+            )
+            if parsed["id"] in observation_ids:
+                raise PerceptionError(f"duplicate observation id {parsed['id']!r}")
+            observation_ids.add(parsed["id"])
+            parsed_observations.append(parsed)
+
+        by_id = {record["id"]: record for record in records}
+        seen: list[str] = []
+        for observation in parsed_observations:
+            entity_id = observation["id"]
+            seen.append(entity_id)
+            if entity_id in by_id:
+                record = by_id[entity_id]
+                record["kind"] = observation["kind"]
+                record["confidence"] = observation["confidence"]
+                record["position"] = observation["position"]
+                record["data"] = observation["data"]
+                record["last_seen"] = now
+            else:
+                record = {
+                    "id": entity_id,
+                    "kind": observation["kind"],
+                    "last_seen": now,
+                    "confidence": observation["confidence"],
+                    "position": observation["position"],
+                    "data": observation["data"],
+                }
+                by_id[entity_id] = record
+                records.append(record)
+
+        updated: list[dict] = []
+        forgotten: list[str] = []
+        for record in records:
+            entity_id = record["id"]
+            if entity_id not in observation_ids and now - record["last_seen"] >= retention:
+                forgotten.append(entity_id)
+                continue
+            updated.append(
+                {
+                    "id": record["id"],
+                    "kind": record["kind"],
+                    "last_seen": record["last_seen"],
+                    "confidence": record["confidence"],
+                    "position": dict(record["position"]),
+                    "data": deepcopy(record["data"]),
+                }
+            )
+
+        return {"status": "UPDATED", "memory": updated, "seen": seen, "forgotten": forgotten}
