@@ -11,7 +11,9 @@ supplied world state to the supplied goal; each ``find_path`` call searches
 a one-shot grid request for a minimum-cost orthogonal route; each
 ``select_utility`` call scores the supplied options against the supplied
 context once and picks the best; each ``update_perception`` call validates
-the supplied memory and observations once and returns the merged memory. No
+the supplied memory and observations once and returns the merged memory;
+each ``select_avoidance`` call evaluates the supplied candidate velocities
+once and returns the admissible one closest to the desired velocity. No
 state is kept between calls.
 """
 
@@ -53,6 +55,10 @@ class UtilityError(ValueError):
 
 class PerceptionError(ValueError):
     """Raised when a perception-memory request fails validation."""
+
+
+class SteeringError(ValueError):
+    """Raised when a steering-avoidance request fails validation."""
 
 
 _UTILITY_CURVES = ("linear", "inverse")
@@ -435,8 +441,62 @@ def _validate_perception_entity(entity: Any, where: str, now: float, *, last_see
     return parsed
 
 
+def _validate_vector(value: Any, where: str) -> tuple[float, float]:
+    """Validate ``{"x": finite number, "y": finite number}``."""
+    if not isinstance(value, dict):
+        raise SteeringError(f"{where} must be an object")
+    if "x" not in value or not _is_finite_number(value["x"]):
+        raise SteeringError(f"{where}.x must be a finite number")
+    if "y" not in value or not _is_finite_number(value["y"]):
+        raise SteeringError(f"{where}.y must be a finite number")
+    return float(value["x"]), float(value["y"])
+
+
+def _validate_disk(entity: Any, where: str) -> tuple[str, tuple[float, float], float]:
+    """Validate a disc's ``id``, ``position`` and positive ``radius``."""
+    if not isinstance(entity, dict):
+        raise SteeringError(f"{where} must be an object")
+    entity_id = entity.get("id")
+    if not _is_valid_key(entity_id):
+        raise SteeringError(f"{where} requires a non-empty string id")
+    position = _validate_vector(entity.get("position"), f"{where}.position")
+    radius = entity.get("radius")
+    if not _is_finite_number(radius) or radius <= 0:
+        raise SteeringError(f"{where}.radius must be a positive finite number")
+    return entity_id, position, float(radius)
+
+
+def _relative_motion_collides(
+    rel_position: tuple[float, float],
+    rel_velocity: tuple[float, float],
+    distance: float,
+    horizon: float,
+) -> bool:
+    """Whether two discs on straight-line trajectories touch within time.
+
+    ``rel_position``/``rel_velocity`` are the other disc relative to the
+    agent, ``distance`` the sum of the radii. The relative centre follows
+    ``r + v t``; a collision happens iff its norm reaches ``distance`` at
+    some ``t`` in the closed interval ``[0, horizon]``.
+    """
+    rx, ry = rel_position
+    vx, vy = rel_velocity
+    a = vx * vx + vy * vy
+    b = 2.0 * (rx * vx + ry * vy)
+    c = rx * rx + ry * ry - distance * distance
+    if c <= 0.0:
+        return True  # already overlapping (or touching) at t = 0
+    if a == 0.0:
+        return False  # fixed separation strictly above the radii sum
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        return False
+    root = (-b - math.sqrt(disc)) / (2.0 * a)
+    return 0.0 <= root <= horizon
+
+
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering."""
     name = "npcmind"
     version = __version__
 
@@ -907,4 +967,146 @@ class Service:
             "memory": merged,
             "seen": [entity["id"] for entity in parsed_observations],
             "forgotten": forgotten,
+        }
+
+    def select_avoidance(self, request: Any) -> dict:
+        """Pick one admissible candidate velocity for this step.
+
+        The request is validated in full before any candidate is evaluated.
+        The agent is a disc with finite ``position``, positive ``radius``,
+        non-negative finite ``max_speed`` and finite ``desired_velocity``;
+        ``time_horizon`` is a positive finite number. ``neighbors`` is a list
+        of discs carrying a finite ``velocity``, ``obstacles`` a list of
+        stationary discs; both lists may be empty and their ids are unique
+        across the merged sequence (neighbors first). ``candidates`` is a
+        non-empty list of ``{id, velocity}`` with unique non-empty ids.
+
+        Each candidate is projected as straight uniform motion. A candidate
+        collides with an object when the centre distance is at most the sum
+        of the radii at any time in the closed interval
+        ``[0, time_horizon]``. A candidate is admissible only when its speed
+        does not exceed ``max_speed`` and it collides with nothing. Among
+        admissible candidates the one closest (Euclidean distance) to
+        ``desired_velocity`` is chosen; ties go to the earlier candidate.
+        Every candidate is reported in order with ``speed_ok``,
+        ``collision_ids`` (neighbors in order, then obstacles) and
+        ``admissible``. With no admissible candidate the status is
+        ``BLOCKED`` with null ``selected`` and a zero ``velocity``. Raises
+        ValueError (SteeringError) on any invalid input; the request is
+        never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise SteeringError("request must be a JSON object")
+        for field in (
+            "agent",
+            "max_speed",
+            "desired_velocity",
+            "time_horizon",
+            "candidates",
+        ):
+            if field not in request:
+                raise SteeringError(f"request is missing {field!r}")
+        agent = request["agent"]
+        if not isinstance(agent, dict):
+            raise SteeringError("agent must be an object")
+        agent_position = _validate_vector(agent.get("position"), "agent.position")
+        agent_radius = agent.get("radius")
+        if not _is_finite_number(agent_radius) or agent_radius <= 0:
+            raise SteeringError("agent.radius must be a positive finite number")
+        agent_radius = float(agent_radius)
+        max_speed = request["max_speed"]
+        if not _is_finite_number(max_speed) or max_speed < 0:
+            raise SteeringError("max_speed must be a non-negative finite number")
+        desired_velocity = _validate_vector(request["desired_velocity"], "desired_velocity")
+        time_horizon = request["time_horizon"]
+        if not _is_finite_number(time_horizon) or time_horizon <= 0:
+            raise SteeringError("time_horizon must be a positive finite number")
+        neighbors_raw = request.get("neighbors", [])
+        if not isinstance(neighbors_raw, list):
+            raise SteeringError("neighbors must be a list")
+        obstacles_raw = request.get("obstacles", [])
+        if not isinstance(obstacles_raw, list):
+            raise SteeringError("obstacles must be a list")
+        candidates_raw = request["candidates"]
+        if not isinstance(candidates_raw, list) or not candidates_raw:
+            raise SteeringError("candidates must be a non-empty list")
+
+        # (id, position, radius, velocity); obstacles carry zero velocity.
+        objects: list[tuple[str, tuple[float, float], float, tuple[float, float]]] = []
+        seen_object_ids: set[str] = set()
+        for index, neighbor in enumerate(neighbors_raw):
+            where = f"neighbor at neighbors[{index}]"
+            neighbor_id, position, radius = _validate_disk(neighbor, where)
+            if neighbor_id in seen_object_ids:
+                raise SteeringError(f"duplicate object id {neighbor_id!r}")
+            seen_object_ids.add(neighbor_id)
+            velocity = _validate_vector(neighbor.get("velocity"), f"{where}.velocity")
+            objects.append((neighbor_id, position, radius, velocity))
+        for index, obstacle in enumerate(obstacles_raw):
+            where = f"obstacle at obstacles[{index}]"
+            obstacle_id, position, radius = _validate_disk(obstacle, where)
+            if obstacle_id in seen_object_ids:
+                raise SteeringError(f"duplicate object id {obstacle_id!r}")
+            seen_object_ids.add(obstacle_id)
+            objects.append((obstacle_id, position, radius, (0.0, 0.0)))
+
+        parsed_candidates: list[tuple[str, tuple[float, float], dict]] = []
+        seen_candidate_ids: set[str] = set()
+        for index, candidate in enumerate(candidates_raw):
+            where = f"candidate at candidates[{index}]"
+            if not isinstance(candidate, dict):
+                raise SteeringError(f"{where} must be an object")
+            candidate_id = candidate.get("id")
+            if not _is_valid_key(candidate_id):
+                raise SteeringError(f"{where} requires a non-empty string id")
+            if candidate_id in seen_candidate_ids:
+                raise SteeringError(f"duplicate candidate id {candidate_id!r}")
+            seen_candidate_ids.add(candidate_id)
+            velocity = _validate_vector(candidate.get("velocity"), f"{where}.velocity")
+            parsed_candidates.append((candidate_id, velocity, candidate))
+
+        ax, ay = agent_position
+        dx, dy = desired_velocity
+        evaluations: list[dict] = []
+        selected_index: int | None = None
+        selected_distance: float | None = None
+        for index, (candidate_id, velocity, original) in enumerate(parsed_candidates):
+            vx, vy = velocity
+            speed_ok = vx * vx + vy * vy <= max_speed * max_speed
+            collision_ids: list[str] = []
+            for object_id, (ox, oy), object_radius, (ovx, ovy) in objects:
+                if _relative_motion_collides(
+                    (ox - ax, oy - ay),
+                    (ovx - vx, ovy - vy),
+                    agent_radius + object_radius,
+                    time_horizon,
+                ):
+                    collision_ids.append(object_id)
+            admissible = speed_ok and not collision_ids
+            evaluations.append(
+                {
+                    "id": candidate_id,
+                    "speed_ok": speed_ok,
+                    "collision_ids": collision_ids,
+                    "admissible": admissible,
+                }
+            )
+            if admissible:
+                distance = math.hypot(vx - dx, vy - dy)
+                if selected_distance is None or distance < selected_distance:
+                    selected_index = index
+                    selected_distance = distance
+
+        if selected_index is None:
+            return {
+                "status": "BLOCKED",
+                "selected": None,
+                "velocity": {"x": 0, "y": 0},
+                "evaluations": evaluations,
+            }
+        return {
+            "status": "SELECTED",
+            "selected": parsed_candidates[selected_index][0],
+            "velocity": deepcopy(parsed_candidates[selected_index][2]["velocity"]),
+            "evaluations": evaluations,
         }
