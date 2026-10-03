@@ -36,6 +36,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/dialogue/intents/match": ("match_dialogue_intent", "invalid_dialogue"),
         "/v1/schedules/decide": ("select_schedule_activity", "invalid_schedule"),
         "/v1/teams/assign": ("assign_team_roles", "invalid_team_assignment"),
+        "/v1/difficulty/adjust": ("adjust_difficulty", "invalid_difficulty"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:

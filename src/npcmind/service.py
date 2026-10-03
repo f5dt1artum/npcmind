@@ -21,7 +21,9 @@ against the supplied rule-based intent patterns once; each
 ``select_schedule_activity`` call evaluates the supplied activities
 against the supplied minute and need levels once and picks at most one;
 each ``assign_team_roles`` call validates the supplied roles and agents
-once and computes one total-score-maximising role assignment.
+once and computes one total-score-maximising role assignment;
+each ``adjust_difficulty`` call validates the supplied target and signals
+once and returns one stateless difficulty suggestion.
 No state is kept between calls.
 """
 
@@ -84,6 +86,10 @@ class ScheduleError(ValueError):
 
 class TeamAssignmentError(ValueError):
     """Raised when a team-role-assignment request fails validation."""
+
+
+class DifficultyError(ValueError):
+    """Raised when a difficulty-adjustment request fails validation."""
 
 
 _SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -593,7 +599,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams, difficulty."""
     name = "npcmind"
     version = __version__
 
@@ -1918,4 +1924,137 @@ class Service:
                 }
                 for j in range(role_count)
             ],
+        }
+
+    def adjust_difficulty(self, request: Any) -> dict:
+        """Suggest one stateless difficulty adjustment from recent signals.
+
+        The request is validated in full before any score is computed.
+        ``current_difficulty`` is a finite number in ``[0, 1]`` and ``target``
+        an object with finite ``min``/``max`` in ``[0, 1]`` where
+        ``min <= max``; ``max_step`` is a finite number in ``(0, 1]``, ``now``
+        and ``cooldown`` non-negative finite numbers, and ``last_adjusted_at``
+        an optional non-negative finite number no later than ``now`` (or
+        ``null``/omitted). ``signals`` is a non-empty list whose items each
+        carry a unique non-empty string ``id``, a finite ``value`` in
+        ``[0, 1]`` and a positive finite ``weight``.
+
+        The signal ``score`` is the weight-averaged value
+        ``sum(value * weight) / sum(weight)``. When ``last_adjusted_at`` is
+        set and ``now - last_adjusted_at`` is strictly less than ``cooldown``
+        the difficulty is held and the status is ``COOLDOWN`` (a gap exactly
+        equal to ``cooldown`` allows an adjustment). Otherwise a score above
+        ``max`` raises the difficulty by the minimum of ``score - max``,
+        ``max_step`` and the headroom ``1 - current_difficulty``; a score
+        below ``min`` lowers it by the minimum of ``min - score``,
+        ``max_step`` and the current difficulty; a score inside the closed
+        interval ``[min, max]`` changes nothing. The status is ``INCREASED``,
+        ``DECREASED`` or ``UNCHANGED`` (also used when a capped step lands on
+        a boundary); ``adjustment`` is the new difficulty minus the old one.
+        Raises ValueError (DifficultyError) on any invalid input; the request
+        is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise DifficultyError("request must be a JSON object")
+
+        for field in ("current_difficulty", "target", "max_step", "now", "cooldown", "signals"):
+            if field not in request:
+                raise DifficultyError(f"request is missing {field!r}")
+
+        current = request["current_difficulty"]
+        if not _is_finite_number(current) or not 0 <= current <= 1:
+            raise DifficultyError("current_difficulty must be a finite number between 0 and 1")
+        target = request["target"]
+        if not isinstance(target, dict):
+            raise DifficultyError("target must be an object")
+        if "min" not in target or "max" not in target:
+            raise DifficultyError("target requires finite-number fields min and max")
+        target_min = target["min"]
+        target_max = target["max"]
+        if not _is_finite_number(target_min) or not 0 <= target_min <= 1:
+            raise DifficultyError("target.min must be a finite number between 0 and 1")
+        if not _is_finite_number(target_max) or not 0 <= target_max <= 1:
+            raise DifficultyError("target.max must be a finite number between 0 and 1")
+        if target_min > target_max:
+            raise DifficultyError("target.min must not be greater than target.max")
+        max_step = request["max_step"]
+        if not _is_finite_number(max_step) or not 0 < max_step <= 1:
+            raise DifficultyError("max_step must be a finite number greater than 0 and at most 1")
+        now = request["now"]
+        if not _is_finite_number(now) or now < 0:
+            raise DifficultyError("now must be a non-negative finite number")
+        cooldown = request["cooldown"]
+        if not _is_finite_number(cooldown) or cooldown < 0:
+            raise DifficultyError("cooldown must be a non-negative finite number")
+        if "last_adjusted_at" in request and request["last_adjusted_at"] is not None:
+            last_adjusted = request["last_adjusted_at"]
+            if not _is_finite_number(last_adjusted) or last_adjusted < 0:
+                raise DifficultyError("last_adjusted_at must be a non-negative finite number")
+            if last_adjusted > now:
+                raise DifficultyError("last_adjusted_at must not be later than now")
+        else:
+            last_adjusted = None
+        signals = request["signals"]
+        if not isinstance(signals, list) or not signals:
+            raise DifficultyError("signals must be a non-empty list")
+
+        parsed_signals: list[tuple[Any, float]] = []
+        seen_ids: set[str] = set()
+        for index, signal in enumerate(signals):
+            where = f"signal at signals[{index}]"
+            if not isinstance(signal, dict):
+                raise DifficultyError(f"{where} must be an object")
+            signal_id = signal.get("id")
+            if not _is_valid_key(signal_id):
+                raise DifficultyError(f"{where} requires a non-empty string id")
+            if signal_id in seen_ids:
+                raise DifficultyError(f"duplicate signal id {signal_id!r}")
+            seen_ids.add(signal_id)
+            if "value" not in signal:
+                raise DifficultyError(f"{where} is missing 'value'")
+            value = signal["value"]
+            if not _is_finite_number(value) or not 0 <= value <= 1:
+                raise DifficultyError(f"{where}: value must be a finite number between 0 and 1")
+            if "weight" not in signal:
+                raise DifficultyError(f"{where} is missing 'weight'")
+            weight = signal["weight"]
+            if not _is_finite_number(weight) or weight <= 0:
+                raise DifficultyError(f"{where}: weight must be a positive finite number")
+            parsed_signals.append((value, float(weight)))
+
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for value, weight in parsed_signals:
+            weighted_sum += value * weight
+            weight_total += weight
+        score = weighted_sum / weight_total
+
+        if last_adjusted is not None and now - last_adjusted < cooldown:
+            return {
+                "status": "COOLDOWN",
+                "previous_difficulty": current,
+                "difficulty": current,
+                "score": score,
+                "adjustment": 0,
+            }
+
+        if score > target_max:
+            step = min(score - target_max, max_step, 1 - current)
+            difficulty = current + step
+            status = "INCREASED" if step > 0 else "UNCHANGED"
+        elif score < target_min:
+            step = min(target_min - score, max_step, current)
+            difficulty = current - step
+            status = "DECREASED" if step > 0 else "UNCHANGED"
+        else:
+            difficulty = current
+            step = 0
+            status = "UNCHANGED"
+
+        return {
+            "status": status,
+            "previous_difficulty": current,
+            "difficulty": difficulty,
+            "score": score,
+            "adjustment": difficulty - current,
         }
