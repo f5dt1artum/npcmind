@@ -19,7 +19,9 @@ entities against the supplied observer once and picks the most salient;
 each ``match_dialogue_intent`` call matches the supplied utterance
 against the supplied rule-based intent patterns once; each
 ``select_schedule_activity`` call evaluates the supplied activities
-against the supplied minute and need levels once and picks at most one.
+against the supplied minute and need levels once and picks at most one;
+each ``assign_team_roles`` call validates the supplied roles and agents
+once and computes one total-score-maximising role assignment.
 No state is kept between calls.
 """
 
@@ -78,6 +80,10 @@ class DialogueError(ValueError):
 
 class ScheduleError(ValueError):
     """Raised when a schedule-decision request fails validation."""
+
+
+class TeamAssignmentError(ValueError):
+    """Raised when a team-role-assignment request fails validation."""
 
 
 _SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -587,7 +593,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams."""
     name = "npcmind"
     version = __version__
 
@@ -1648,4 +1654,268 @@ class Service:
             "selected": selected_id,
             "needs": updated_needs,
             "evaluations": evaluations,
+        }
+
+    def assign_team_roles(self, request: Any) -> dict:
+        """Assign agents to at most one role each, maximising total score.
+
+        The request is validated in full before any assignment is computed.
+        ``roles`` and ``agents`` are non-empty lists. Each role has a unique
+        non-empty string ``id`` and a positive integer ``capacity`` (booleans
+        are not integers); each agent has a unique non-empty string ``id`` and
+        a ``scores`` object keyed by role id. A score must be a finite number
+        in ``[0, 1]`` (booleans are not numbers); roles not listed are not
+        available to that agent, and a listed zero score never participates.
+
+        Among all feasible assignments the one with the highest total score
+        wins; ties are broken by encoding each agent's choice as the role's
+        position in ``roles`` (unassigned last) and taking the
+        lexicographically smallest sequence in agent order. All scores are
+        finite floats and therefore exact binary fractions, so optimisation
+        scales them to integers and compares equal decimal totals exactly.
+        Returns ``status`` ``ASSIGNED``, ``assignments`` in agent input order
+        (each ``{"agent", "role", "score"}``, assigned agents only),
+        ``unassigned`` ids in input order, ``total_score`` and ``roles`` in
+        role input order with each role's ``id``, ``capacity``, assigned
+        ``agents`` and score subtotal. With no positive-score candidate the
+        assignments are empty and the total score is zero; that is still
+        ``ASSIGNED``. Raises ValueError (TeamAssignmentError) on any invalid
+        input; the request is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise TeamAssignmentError("request must be a JSON object")
+        roles_in = request.get("roles")
+        if not isinstance(roles_in, list) or not roles_in:
+            raise TeamAssignmentError("roles must be a non-empty list")
+        agents_in = request.get("agents")
+        if not isinstance(agents_in, list) or not agents_in:
+            raise TeamAssignmentError("agents must be a non-empty list")
+
+        role_ids: list[str] = []
+        capacities: list[int] = []
+        role_index_by_id: dict[str, int] = {}
+        for index, role in enumerate(roles_in):
+            where = f"role at roles[{index}]"
+            if not isinstance(role, dict):
+                raise TeamAssignmentError(f"{where} must be an object")
+            role_id = role.get("id")
+            if not _is_valid_key(role_id):
+                raise TeamAssignmentError(f"{where} requires a non-empty string id")
+            if role_id in role_index_by_id:
+                raise TeamAssignmentError(f"duplicate role id {role_id!r}")
+            capacity = role.get("capacity")
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+                raise TeamAssignmentError(f"{where}: capacity must be a positive integer")
+            role_index_by_id[role_id] = len(role_ids)
+            role_ids.append(role_id)
+            capacities.append(capacity)
+
+        agent_ids: list[str] = []
+        # Per agent: role index -> (original score value, exact Fraction).
+        options: list[dict[int, tuple[Any, Fraction]]] = []
+        seen_agent_ids: set[str] = set()
+        for index, agent in enumerate(agents_in):
+            where = f"agent at agents[{index}]"
+            if not isinstance(agent, dict):
+                raise TeamAssignmentError(f"{where} must be an object")
+            agent_id = agent.get("id")
+            if not _is_valid_key(agent_id):
+                raise TeamAssignmentError(f"{where} requires a non-empty string id")
+            if agent_id in seen_agent_ids:
+                raise TeamAssignmentError(f"duplicate agent id {agent_id!r}")
+            seen_agent_ids.add(agent_id)
+            scores = agent.get("scores")
+            if not isinstance(scores, dict):
+                raise TeamAssignmentError(f"{where}: scores must be an object")
+            agent_options: dict[int, tuple[Any, Fraction]] = {}
+            for key, value in scores.items():
+                if not _is_valid_key(key):
+                    raise TeamAssignmentError(
+                        f"{where}.scores key {key!r} must be a non-empty string"
+                    )
+                if key not in role_index_by_id:
+                    raise TeamAssignmentError(
+                        f"{where}.scores references unknown role {key!r}"
+                    )
+                if not _is_finite_number(value) or not 0 <= value <= 1:
+                    raise TeamAssignmentError(
+                        f"{where}.scores[{key!r}] must be a finite number between 0 and 1"
+                    )
+                if value == 0:
+                    continue  # zero scores never participate in assignment
+                agent_options[role_index_by_id[key]] = (value, Fraction(value))
+            agent_ids.append(agent_id)
+            options.append(agent_options)
+
+        # Every finite float is an exact binary fraction, so every score's
+        # denominator is a power of two; scale all scores by the LCM of those
+        # denominators to get plain integer weights. The flow then compares
+        # totals exactly (0.1 + 0.2 and a genuinely equal total tie) with gcd-
+        # free integer arithmetic instead of Fraction operations.
+        scale = 1
+        for agent_options in options:
+            for _, fraction in agent_options.values():
+                scale = math.lcm(scale, fraction.denominator)
+
+        def weight_of(fraction: Fraction) -> int:
+            return fraction.numerator * (scale // fraction.denominator)
+
+        role_count = len(role_ids)
+        agent_count = len(agent_ids)
+        unassigned_token = role_count
+
+        # One min-cost max-flow over source -> agents -> roles -> sink, with an
+        # extra agent -> sink edge for leaving an agent unassigned, so pushing
+        # one unit per agent is always feasible. Edge costs are ordered pairs
+        # ``(negated scaled score, lexicographic weight)`` compared
+        # lexicographically and added componentwise: the first component
+        # maximises the total score, and among equal totals the second
+        # minimises the base-(role_count + 1) integer with digit choice_i
+        # (role position, unassigned last), which is exactly the
+        # lexicographically smallest choice sequence in agent order.
+        base = role_count + 1
+        source = 0
+        agent_base = 1
+        role_base = agent_base + agent_count
+        sink = role_base + role_count
+        graph: list[list[int]] = [[] for _ in range(sink + 1)]
+        edges: list[list] = []  # [u, v, residual capacity, score cost, tie-break cost]
+
+        def add_edge(u: int, v: int, capacity: int, score_cost: int, tie_cost: int) -> int:
+            index = len(edges)
+            graph[u].append(index)
+            edges.append([u, v, capacity, score_cost, tie_cost])
+            graph[v].append(index + 1)
+            edges.append([v, u, 0, -score_cost, -tie_cost])
+            return index
+
+        used_edge: dict[tuple[int, int], int] = {}
+        for k, agent_options in enumerate(options):
+            agent_node = agent_base + k
+            add_edge(source, agent_node, 1, 0, 0)
+            add_edge(agent_node, sink, 1, 0, base ** (agent_count - 1 - k) * role_count)
+            for role_index, (_, score) in agent_options.items():
+                edge_index = add_edge(
+                    agent_node,
+                    role_base + role_index,
+                    1,
+                    -weight_of(score),
+                    base ** (agent_count - 1 - k) * role_index,
+                )
+                used_edge[(k, role_index)] = edge_index
+        for role_index in range(role_count):
+            add_edge(role_base + role_index, sink, capacities[role_index], 0, 0)
+
+        # Successive shortest paths with Johnson potentials. The initial
+        # network is a DAG in node-index order, so the first shortest-path
+        # labelling is a single forward relaxation pass (negative edges
+        # included); afterwards reduced costs on the residual network are
+        # non-negative and each augmentation uses a heap Dijkstra. Labels are
+        # the ordered ``(int score cost, int tie-break cost)`` pairs.
+        Label = tuple[int, int]
+        potentials: list[Label] = [(0, 0)] * (sink + 1)
+        first_dist: list[Label | None] = [None] * (sink + 1)
+        first_dist[source] = (0, 0)
+        for u in range(sink + 1):
+            here = first_dist[u]
+            if here is None:
+                continue
+            for edge_index in graph[u]:
+                edge = edges[edge_index]
+                _, v, residual, score_cost, tie_cost = edge
+                if residual <= 0:
+                    continue
+                tentative = (here[0] + score_cost, here[1] + tie_cost)
+                current = first_dist[v]
+                if current is None or tentative < current:
+                    first_dist[v] = tentative
+        for v, distance in enumerate(first_dist):
+            if distance is not None:
+                potentials[v] = distance
+
+        for _ in range(agent_count):
+            distances: list[Label | None] = [None] * (sink + 1)
+            previous: list[int | None] = [None] * (sink + 1)
+            distances[source] = (0, 0)
+            heap: list[tuple[int, int, int]] = [(0, 0, source)]
+            while heap:
+                score_dist, tie_dist, u = heapq.heappop(heap)
+                current = distances[u]
+                if current is None or (score_dist, tie_dist) != current:
+                    continue
+                pot_u_score, pot_u_tie = potentials[u]
+                for edge_index in graph[u]:
+                    edge = edges[edge_index]
+                    _, v, residual, score_cost, tie_cost = edge
+                    if residual <= 0:
+                        continue
+                    pot_v_score, pot_v_tie = potentials[v]
+                    reduced = (
+                        score_cost + pot_u_score - pot_v_score,
+                        tie_cost + pot_u_tie - pot_v_tie,
+                    )
+                    tentative = (score_dist + reduced[0], tie_dist + reduced[1])
+                    known = distances[v]
+                    if known is None or tentative < known:
+                        distances[v] = tentative
+                        previous[v] = edge_index
+                        heapq.heappush(heap, (tentative[0], tentative[1], v))
+            if distances[sink] is None:
+                break  # unreachable: cannot happen thanks to unassigned edges
+            for v, distance in enumerate(distances):
+                if distance is not None:
+                    pot = potentials[v]
+                    potentials[v] = (pot[0] + distance[0], pot[1] + distance[1])
+            v = sink
+            while v != source:
+                edge_index = previous[v]
+                assert edge_index is not None
+                edge = edges[edge_index]
+                edge[2] -= 1
+                edges[edge_index ^ 1][2] += 1
+                v = edge[0]
+
+        chosen: list[int] = []
+        for k in range(agent_count):
+            picked = unassigned_token
+            for role_index in options[k]:
+                if edges[used_edge[(k, role_index)]][2] == 0:
+                    picked = role_index
+                    break
+            chosen.append(picked)
+
+        assignments: list[dict] = []
+        unassigned: list[str] = []
+        role_agents: list[list[str]] = [[] for _ in range(role_count)]
+        role_subtotals = [Fraction(0) for _ in range(role_count)]
+        total = Fraction(0)
+        for i, choice in enumerate(chosen):
+            if choice == unassigned_token:
+                unassigned.append(agent_ids[i])
+                continue
+            value = options[i][choice][0]
+            assignments.append({"agent": agent_ids[i], "role": role_ids[choice], "score": value})
+            role_agents[choice].append(agent_ids[i])
+            role_subtotals[choice] += options[i][choice][1]
+            total += options[i][choice][1]
+
+        def fraction_to_number(value: Fraction) -> Any:
+            if value.denominator == 1:
+                return value.numerator
+            return float(value)
+
+        return {
+            "status": "ASSIGNED",
+            "assignments": assignments,
+            "unassigned": unassigned,
+            "total_score": fraction_to_number(total),
+            "roles": [
+                {
+                    "id": role_ids[j],
+                    "capacity": capacities[j],
+                    "agents": role_agents[j],
+                    "score": fraction_to_number(role_subtotals[j]),
+                }
+                for j in range(role_count)
+            ],
         }
