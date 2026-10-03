@@ -1,0 +1,110 @@
+import http.client
+import json
+import threading
+import unittest
+from http.server import ThreadingHTTPServer
+
+from npcmind.server import Handler
+
+
+class DialogueHttpTest(unittest.TestCase):
+    def setUp(self):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join()
+
+    def post(self, path, raw_body):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("POST", path, raw_body, {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
+        conn.close()
+        return response.status, json.loads(body)
+
+    def base_payload(self, **overrides):
+        payload = {
+            "utterance": "attack the goblin",
+            "intents": [
+                {"id": "attack", "patterns": ["attack the {target}"], "priority": 2},
+                {"id": "greet", "patterns": ["hello"]},
+            ],
+            "context": {"armed": True},
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_matched_round_trip(self):
+        status, body = self.post(
+            "/v1/dialogue/intents/match", json.dumps(self.base_payload())
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "MATCHED")
+        self.assertEqual(body["intent"], "attack")
+        self.assertEqual(body["slots"], {"target": "goblin"})
+        self.assertEqual(len(body["candidates"]), 1)
+        candidate = body["candidates"][0]
+        self.assertEqual(candidate["id"], "attack")
+        self.assertEqual(candidate["priority"], 2)
+        self.assertEqual(candidate["words"], 2)
+        self.assertEqual(candidate["pattern"], 0)
+        self.assertEqual(candidate["slots"], {"target": "goblin"})
+
+    def test_no_match_round_trip(self):
+        status, body = self.post(
+            "/v1/dialogue/intents/match",
+            json.dumps(self.base_payload(utterance="run away")),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body,
+            {"status": "NO_MATCH", "intent": None, "slots": {}, "candidates": []},
+        )
+
+    def test_invalid_request_returns_422_invalid_dialogue(self):
+        for payload in (
+            self.base_payload(utterance="   "),
+            self.base_payload(intents=[]),
+            self.base_payload(intents=[{"id": "a", "patterns": ["hi"], "priority": True}]),
+            self.base_payload(intents=[{"id": "a", "patterns": ["{1x}"]}]),
+            self.base_payload(
+                intents=[
+                    {"id": "a", "patterns": ["hi"]},
+                    {"id": "a", "patterns": ["yo"]},
+                ]
+            ),
+        ):
+            with self.subTest(payload=payload):
+                status, body = self.post(
+                    "/v1/dialogue/intents/match", json.dumps(payload)
+                )
+                self.assertEqual(status, 422)
+                self.assertEqual(body["error"]["code"], "invalid_dialogue")
+
+    def test_unparseable_json_returns_400_invalid_json(self):
+        status, body = self.post("/v1/dialogue/intents/match", "{not json")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_json")
+
+    def test_non_finite_json_constant_returns_400_invalid_json(self):
+        status, body = self.post("/v1/dialogue/intents/match", '{"utterance": NaN}')
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_json")
+
+    def test_health_still_ok(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/healthz")
+        response = conn.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["status"], "ok")
+
+
+if __name__ == "__main__":
+    unittest.main()
