@@ -19,7 +19,9 @@ entities against the supplied observer once and picks the most salient;
 each ``match_dialogue_intent`` call matches the supplied utterance
 against the supplied rule-based intent patterns once; each
 ``select_schedule_activity`` call evaluates the supplied activities
-against the supplied minute and need levels once and picks at most one.
+against the supplied minute and need levels once and picks at most one;
+each ``assign_team_roles`` call assigns the supplied agents to the
+supplied capacity-limited roles once, maximising the total score.
 No state is kept between calls.
 """
 
@@ -78,6 +80,10 @@ class DialogueError(ValueError):
 
 class ScheduleError(ValueError):
     """Raised when a schedule-decision request fails validation."""
+
+
+class TeamAssignmentError(ValueError):
+    """Raised when a team role-assignment request fails validation."""
 
 
 _SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -587,7 +593,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams."""
     name = "npcmind"
     version = __version__
 
@@ -1648,4 +1654,164 @@ class Service:
             "selected": selected_id,
             "needs": updated_needs,
             "evaluations": evaluations,
+        }
+
+    def assign_team_roles(self, request: Any) -> dict:
+        """Assign agents to capacity-limited roles maximising total score.
+
+        The request is validated in full before any assignment is computed.
+        ``agents`` and ``roles`` are non-empty lists. Each role requires a
+        unique non-empty string ``id`` and a positive integer ``capacity``
+        (booleans are not integers). Each agent requires a unique non-empty
+        string ``id`` and a ``scores`` object mapping role ids to finite
+        numbers in ``[0, 1]`` (booleans are not numbers); a role missing
+        from an agent's ``scores`` cannot be taken by that agent, and a
+        zero score never takes part in an assignment.
+
+        Every agent receives at most one role and no role receives more
+        agents than its capacity. The chosen assignment maximises the total
+        score; ties are broken by reading the agents in input order as a
+        sequence of role positions in ``roles`` (an unassigned agent sorts
+        after every role) and taking the lexicographically smallest
+        sequence, so the result is deterministic. The status is always
+        ``ASSIGNED``: ``assignments`` lists the assigned agents in input
+        order as ``agent``/``role``/``score`` triples, ``unassigned``
+        lists the remaining agent ids in input order, ``total_score`` is
+        the summed score, and ``roles`` echoes every role in input order
+        with its ``id``, ``capacity``, assigned agent ids and score
+        subtotal. With no positive-score candidate the assignment is empty
+        and the total is zero. Raises ValueError (TeamAssignmentError) on
+        any invalid input; the request is never mutated and no state is
+        kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise TeamAssignmentError("request must be a JSON object")
+        agents = request.get("agents")
+        if not isinstance(agents, list) or not agents:
+            raise TeamAssignmentError("agents must be a non-empty list")
+        roles = request.get("roles")
+        if not isinstance(roles, list) or not roles:
+            raise TeamAssignmentError("roles must be a non-empty list")
+
+        parsed_roles: list[tuple[str, int]] = []
+        role_ids: set[str] = set()
+        for index, role in enumerate(roles):
+            where = f"role at roles[{index}]"
+            if not isinstance(role, dict):
+                raise TeamAssignmentError(f"{where} must be an object")
+            role_id = role.get("id")
+            if not _is_valid_key(role_id):
+                raise TeamAssignmentError(f"{where} requires a non-empty string id")
+            if role_id in role_ids:
+                raise TeamAssignmentError(f"duplicate role id {role_id!r}")
+            role_ids.add(role_id)
+            capacity = role.get("capacity")
+            if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+                raise TeamAssignmentError(
+                    f"role {role_id!r}: capacity must be a positive integer"
+                )
+            parsed_roles.append((role_id, capacity))
+
+        role_position = {role_id: index for index, (role_id, _) in enumerate(parsed_roles)}
+
+        # (agent id, [(role position, raw score)]) with positive scores only,
+        # edges sorted by role position for a deterministic search order.
+        parsed_agents: list[tuple[str, list[tuple[int, Any]]]] = []
+        agent_ids: set[str] = set()
+        for index, agent in enumerate(agents):
+            where = f"agent at agents[{index}]"
+            if not isinstance(agent, dict):
+                raise TeamAssignmentError(f"{where} must be an object")
+            agent_id = agent.get("id")
+            if not _is_valid_key(agent_id):
+                raise TeamAssignmentError(f"{where} requires a non-empty string id")
+            if agent_id in agent_ids:
+                raise TeamAssignmentError(f"duplicate agent id {agent_id!r}")
+            agent_ids.add(agent_id)
+            where = f"agent {agent_id!r}"
+            scores = agent.get("scores")
+            if not isinstance(scores, dict):
+                raise TeamAssignmentError(f"{where}: scores must be an object")
+            edges: list[tuple[int, Any]] = []
+            for scored_role, score in scores.items():
+                if scored_role not in role_position:
+                    raise TeamAssignmentError(
+                        f"{where}: scores reference unknown role {scored_role!r}"
+                    )
+                if not _is_finite_number(score) or not 0 <= score <= 1:
+                    raise TeamAssignmentError(
+                        f"{where}: score for role {scored_role!r} must be a finite"
+                        " number between 0 and 1"
+                    )
+                if score > 0:
+                    edges.append((role_position[scored_role], score))
+            edges.sort(key=lambda edge: edge[0])
+            parsed_agents.append((agent_id, edges))
+
+        role_count = len(parsed_roles)
+        # Dynamic programming over the agents in input order; the state is
+        # the tuple of remaining role capacities and each state keeps its
+        # best (exact total, choice sequence). Totals are Fractions so
+        # comparison is exact; choice sequences use the role position in
+        # ``roles`` with ``role_count`` marking an unassigned agent, so the
+        # lexicographic tie-break falls out of plain tuple comparison.
+        states: dict[tuple[int, ...], tuple[Fraction, tuple[int, ...]]] = {
+            tuple(capacity for _, capacity in parsed_roles): (Fraction(0), ())
+        }
+        for _, edges in parsed_agents:
+            next_states: dict[tuple[int, ...], tuple[Fraction, tuple[int, ...]]] = {}
+            for remaining, (total, choices) in states.items():
+                options = [(role_count, remaining, total)]
+                for position, score in edges:
+                    if remaining[position] > 0:
+                        lowered = (
+                            remaining[:position]
+                            + (remaining[position] - 1,)
+                            + remaining[position + 1:]
+                        )
+                        options.append((position, lowered, total + Fraction(score)))
+                for choice, next_remaining, next_total in options:
+                    next_choices = choices + (choice,)
+                    known = next_states.get(next_remaining)
+                    if (
+                        known is None
+                        or next_total > known[0]
+                        or (next_total == known[0] and next_choices < known[1])
+                    ):
+                        next_states[next_remaining] = (next_total, next_choices)
+            states = next_states
+
+        _, best_choices = min(states.values(), key=lambda entry: (-entry[0], entry[1]))
+
+        assignments: list[dict] = []
+        unassigned: list[str] = []
+        role_agents: list[list[str]] = [[] for _ in parsed_roles]
+        role_subtotals: list[Any] = [0] * role_count
+        total_score: Any = 0
+        for (agent_id, edges), choice in zip(parsed_agents, best_choices):
+            if choice == role_count:
+                unassigned.append(agent_id)
+                continue
+            score = dict(edges)[choice]
+            assignments.append(
+                {"agent": agent_id, "role": parsed_roles[choice][0], "score": score}
+            )
+            role_agents[choice].append(agent_id)
+            role_subtotals[choice] += score
+            total_score += score
+
+        return {
+            "status": "ASSIGNED",
+            "assignments": assignments,
+            "unassigned": unassigned,
+            "total_score": total_score,
+            "roles": [
+                {
+                    "id": role_id,
+                    "capacity": capacity,
+                    "agents": role_agents[position],
+                    "score": role_subtotals[position],
+                }
+                for position, (role_id, capacity) in enumerate(parsed_roles)
+            ],
         }

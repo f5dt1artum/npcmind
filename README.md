@@ -30,10 +30,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/schedules/decide` 执行一次性日程与需求决策：请求体为 `{"now": 600, "needs": {"hunger": 0.8}, "activities": [...]}`。`now` 是 0 到 1439 的整数分钟（布尔值不视为整数）；`needs` 是以非空字符串为键、以 0 到 1 有限数为值的对象；`activities` 是非空数组，每项含唯一非空字符串 `id`、0 到 1439 的整数 `start_minute` 与 `end_minute`、可省略的整数 `priority`（默认 0），以及可省略的 `need`；带 `need` 的活动还须引用已声明的需求键，并提供 0 到 1 的有限数 `trigger` 与 `relief`。日程窗口起点包含、终点不包含：起点小于终点为同日区间，起点大于终点为跨午夜区间，二者相等表示全天。活动在当前时刻位于窗口内即为 `scheduled`，其关联需求值大于等于 `trigger` 即为 `urgent`，二者之一即为 `eligible`。紧急活动始终优先于仅按日程可选的活动：多个紧急活动先取需求值较高者，再取 `priority` 较高者，仍相同取输入靠前者；仅按日程可选时按 `priority` 降序并以输入顺序破同分。选中后只把其关联需求更新为 `max(0, 原值减 relief)`，无关联需求的活动不改变需求。有可选活动时返回 `status` 为 `SELECTED`、选中的 `selected` id 与更新后的 `needs`；没有可选项时返回 `status` 为 `IDLE`、`selected` 为 `null` 与原始 `needs`；两种结果都返回按输入顺序列出每项 `id`、`scheduled`、`urgent`、`eligible` 与 `need_level`（无关联需求为 `null`）的 `evaluations`。请求在决策前完整校验：结构、标识、引用、类型、有限性或范围约束不满足时整体失败，返回 422 `invalid_schedule`，不返回部分结果；JSON 无法解析返回 400 `invalid_json`。Python 侧等价入口为 `Service.select_schedule_activity(request)`，同类错误抛出 `ValueError`。调用不修改传入的请求及其嵌套对象，也不保存跨请求状态。
 
+`POST /v1/teams/assign` 执行一次性队伍角色分配：请求体为 `{"agents": [...], "roles": [...]}`，二者均为非空数组。每个角色含唯一非空字符串 `id` 与正整数 `capacity`（布尔值不视为整数）；每个智能体含唯一非空字符串 `id` 与 `scores` 对象，`scores` 以角色 id 为键、以 0 到 1 的有限数为值（布尔值不视为数字），未列出的角色不可担任，零分不参与分配。每个智能体最多获得一个角色，每个角色的人数不超过容量；分配在全部可行方案中使总分最高，总分相同时按 agents 顺序把每个智能体的选择表示为角色在 roles 中的下标（未分配排在所有角色之后），取字典序最小的序列，结果确定。返回 `status` 为 `ASSIGNED`、按 agents 原顺序且仅含已分配者的 `assignments`（每项为 `agent` / `role` / `score`）、按原顺序列出其余 id 的 `unassigned`、`total_score`，以及按输入顺序给出每个角色 `id`、`capacity`、已分配智能体 id 数组与分数小计的 `roles`；没有正分候选时仍返回 `ASSIGNED`，分配为空、所有智能体未分配且总分为零。请求在计算前完整校验：请求或集合结构错误、集合为空、条目不是对象、id 非法或各自重复、capacity 不是正整数或为布尔值、scores 不是对象、引用未知角色、分数为布尔值、非有限数或越界时整体失败，返回 422 `invalid_team_assignment`，不返回部分结果；JSON 无法解析返回 400 `invalid_json`。Python 侧等价入口为 `Service.assign_team_roles(request)`，同类错误抛出 `ValueError`。调用不修改传入的请求及其嵌套对象，也不保存跨请求状态。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策、一次性感知记忆更新、一次性局部避障选速、一次性无状态注意力评估、规则式对话意图匹配与一次性日程与需求决策；难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策、一次性感知记忆更新、一次性局部避障选速、一次性无状态注意力评估、规则式对话意图匹配、一次性日程与需求决策与一次性队伍角色分配；难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。
