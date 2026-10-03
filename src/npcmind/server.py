@@ -26,6 +26,7 @@ class Handler(BaseHTTPRequestHandler):
     service = Service()
     post_routes = {
         "/v1/behavior-trees/evaluate": ("evaluate_behavior", "invalid_tree"),
+        "/v1/behavior-trees/visualize": ("export_behavior_tree", "invalid_behavior_visualization"),
         "/v1/state-machines/step": ("step_state_machine", "invalid_state_machine"),
         "/v1/goap/plan": ("plan_goap", "invalid_goap"),
         "/v1/navigation/path": ("find_path", "invalid_navigation"),

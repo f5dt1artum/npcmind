@@ -251,5 +251,179 @@ class EvaluateBehaviorErrorsTest(unittest.TestCase):
         self.assert_invalid({"tree": {"id": "r", "type": "sequence", "children": {}}}, "children")
 
 
+class ExportBehaviorTreeTest(unittest.TestCase):
+    def setUp(self):
+        self.service = Service()
+
+    def tree(self):
+        return {
+            "id": "root",
+            "type": "sequence",
+            "children": [
+                condition("c1", "exists", "x"),
+                {
+                    "id": "fallback",
+                    "type": "selector",
+                    "children": [
+                        action("a1", "set", key="y", value=1),
+                        action("a2", "status", status="RUNNING"),
+                    ],
+                },
+                action("a3", "delete", key="z"),
+            ],
+        }
+
+    def export(self, tree, trace=None):
+        request = {"tree": tree}
+        if trace is not None:
+            request["trace"] = trace
+        return self.service.export_behavior_tree(request)
+
+    def assert_invalid(self, request, fragment):
+        with self.assertRaises(ValueError) as caught:
+            self.service.export_behavior_tree(request)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_full_tree_without_trace(self):
+        result = self.export(self.tree())
+        self.assertEqual(result["status"], "EXPORTED")
+        self.assertEqual(
+            result["nodes"],
+            [
+                {"id": "root", "type": "sequence", "depth": 0, "visited": False, "status": None},
+                {"id": "c1", "type": "condition", "depth": 1, "visited": False, "status": None},
+                {"id": "fallback", "type": "selector", "depth": 1, "visited": False, "status": None},
+                {"id": "a1", "type": "action", "depth": 2, "visited": False, "status": None},
+                {"id": "a2", "type": "action", "depth": 2, "visited": False, "status": None},
+                {"id": "a3", "type": "action", "depth": 1, "visited": False, "status": None},
+            ],
+        )
+        self.assertEqual(
+            result["edges"],
+            [
+                {"from": "root", "to": "c1", "index": 0},
+                {"from": "root", "to": "fallback", "index": 1},
+                {"from": "root", "to": "a3", "index": 2},
+                {"from": "fallback", "to": "a1", "index": 0},
+                {"from": "fallback", "to": "a2", "index": 1},
+            ],
+        )
+        self.assertEqual(result["trace_order"], [])
+
+    def test_partial_trace_marks_visited(self):
+        trace = [
+            {"id": "c1", "type": "condition", "status": "FAILURE"},
+            {"id": "root", "type": "sequence", "status": "FAILURE"},
+        ]
+        result = self.export(self.tree(), trace)
+        self.assertEqual(result["status"], "EXPORTED")
+        by_id = {node["id"]: node for node in result["nodes"]}
+        self.assertEqual(by_id["c1"]["visited"], True)
+        self.assertEqual(by_id["c1"]["status"], "FAILURE")
+        self.assertEqual(by_id["root"]["visited"], True)
+        self.assertEqual(by_id["root"]["status"], "FAILURE")
+        for node_id in ("fallback", "a1", "a2", "a3"):
+            self.assertEqual(by_id[node_id]["visited"], False)
+            self.assertIsNone(by_id[node_id]["status"])
+        self.assertEqual(result["trace_order"], ["c1", "root"])
+
+    def test_selector_short_circuit_trace(self):
+        tree = {
+            "id": "root",
+            "type": "selector",
+            "children": [
+                action("a1", "status", status="FAILURE"),
+                action("a2", "status", status="SUCCESS"),
+                action("a3", "status", status="SUCCESS"),
+            ],
+        }
+        evaluated = self.service.evaluate_behavior({"tree": tree})
+        result = self.export(tree, evaluated["trace"])
+        self.assertEqual(
+            result["trace_order"], ["a1", "a2", "root"]
+        )
+        statuses = {node["id"]: node["status"] for node in result["nodes"]}
+        self.assertEqual(
+            statuses,
+            {"root": "SUCCESS", "a1": "FAILURE", "a2": "SUCCESS", "a3": None},
+        )
+
+    def test_single_node_tree(self):
+        tree = action("only", "status", status="RUNNING")
+        result = self.export(tree, [{"id": "only", "type": "action", "status": "RUNNING"}])
+        self.assertEqual(result["status"], "EXPORTED")
+        self.assertEqual(
+            result["nodes"],
+            [{"id": "only", "type": "action", "depth": 0, "visited": True, "status": "RUNNING"}],
+        )
+        self.assertEqual(result["edges"], [])
+        self.assertEqual(result["trace_order"], ["only"])
+
+    def test_empty_children_produce_no_edges(self):
+        tree = {"id": "root", "type": "sequence", "children": []}
+        result = self.export(tree)
+        self.assertEqual(len(result["nodes"]), 1)
+        self.assertEqual(result["edges"], [])
+
+    def test_request_is_not_mutated(self):
+        tree = self.tree()
+        trace = [{"id": "c1", "type": "condition", "status": "SUCCESS"}]
+        request = {"tree": tree, "trace": trace}
+        snapshot = json.loads(json.dumps(request))
+        self.service.export_behavior_tree(request)
+        self.assertEqual(request, snapshot)
+
+    def test_no_state_between_calls(self):
+        trace = [{"id": "c1", "type": "condition", "status": "SUCCESS"}]
+        first = self.export(self.tree(), trace)
+        second = self.export(self.tree())
+        self.assertEqual(first["trace_order"], ["c1"])
+        self.assertEqual(second["trace_order"], [])
+        visited = {node["id"]: node["visited"] for node in second["nodes"]}
+        self.assertFalse(any(visited.values()))
+
+    def test_request_not_object(self):
+        self.assert_invalid([1, 2], "object")
+
+    def test_missing_tree(self):
+        self.assert_invalid({}, "tree")
+
+    def test_invalid_tree_rules_still_apply(self):
+        self.assert_invalid({"tree": {"id": "r", "type": "parallel"}}, "r")
+        self.assert_invalid(
+            {"tree": {"id": "r", "type": "sequence", "children": [{"id": "r", "type": "sequence"}]}},
+            "duplicate",
+        )
+
+    def test_trace_not_list(self):
+        self.assert_invalid({"tree": self.tree(), "trace": {}}, "trace")
+
+    def test_trace_entry_not_object(self):
+        self.assert_invalid({"tree": self.tree(), "trace": ["c1"]}, "object")
+
+    def test_trace_id_not_non_empty_string(self):
+        self.assert_invalid({"tree": self.tree(), "trace": [{"id": "", "type": "condition", "status": "SUCCESS"}]}, "id")
+        self.assert_invalid({"tree": self.tree(), "trace": [{"type": "condition", "status": "SUCCESS"}]}, "id")
+
+    def test_trace_duplicate_id(self):
+        trace = [
+            {"id": "c1", "type": "condition", "status": "SUCCESS"},
+            {"id": "c1", "type": "condition", "status": "FAILURE"},
+        ]
+        self.assert_invalid({"tree": self.tree(), "trace": trace}, "duplicate")
+
+    def test_trace_unknown_id(self):
+        trace = [{"id": "ghost", "type": "condition", "status": "SUCCESS"}]
+        self.assert_invalid({"tree": self.tree(), "trace": trace}, "ghost")
+
+    def test_trace_type_mismatch(self):
+        trace = [{"id": "c1", "type": "action", "status": "SUCCESS"}]
+        self.assert_invalid({"tree": self.tree(), "trace": trace}, "type")
+
+    def test_trace_illegal_status(self):
+        trace = [{"id": "c1", "type": "condition", "status": "BROKEN"}]
+        self.assert_invalid({"tree": self.tree(), "trace": trace}, "BROKEN")
+
+
 if __name__ == "__main__":
     unittest.main()

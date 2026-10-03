@@ -5,6 +5,8 @@ single-step finite-state-machine driver, one-shot goal-oriented action
 planning, stateless 2D grid navigation, stateless utility scoring, and a
 one-shot perception-memory merge. Each ``evaluate_behavior`` call executes
 exactly one tick of the supplied tree against the supplied blackboard; each
+``export_behavior_tree`` call organises the supplied tree and an optional
+trace into a flat node/edge graph without executing anything; each
 ``step_state_machine`` call advances a machine by exactly one event; each
 ``plan_goap`` call searches for a minimum-cost action sequence from the
 supplied world state to the supplied goal; each ``find_path`` call searches
@@ -46,6 +48,10 @@ _ACTION_OPS = ("set", "delete", "status")
 
 class TreeError(ValueError):
     """Raised when a behavior-tree request fails structural validation."""
+
+
+class VisualizationError(ValueError):
+    """Raised when a behavior-tree visualization request fails validation."""
 
 
 class MachineError(ValueError):
@@ -712,6 +718,103 @@ class Service:
         trace: list = []
         status = _tick(tree, board, trace)
         return {"status": status, "blackboard": board, "trace": trace}
+
+    def export_behavior_tree(self, request: dict) -> dict:
+        """Export a behavior tree and an optional trace as a flat graph.
+
+        The request is validated in full before any graph is produced.
+        ``tree`` follows the same structural rules as ``evaluate_behavior``;
+        ``trace`` is an optional list (default ``[]``) of entries as returned
+        by ``evaluate_behavior``, each naming a node ``id`` that exists in
+        the tree exactly once, the matching ``type`` and a ``status`` of
+        ``SUCCESS``, ``FAILURE`` or ``RUNNING``. Nothing is executed and the
+        blackboard is never touched: the call only organises the structure
+        and the supplied trace.
+
+        Returns ``status`` ``EXPORTED`` plus ``nodes``, ``edges`` and
+        ``trace_order``. ``nodes`` lists every node in depth-first preorder
+        (root first, children in declaration order) with ``id``, ``type``,
+        ``depth``, ``visited`` and ``status``; nodes named by the trace are
+        ``visited`` with the traced ``status``, all others are unvisited
+        with a null ``status``. ``edges`` follows the parent order of
+        ``nodes``, keeping children order within one parent, each entry
+        giving ``from``, ``to`` and the zero-based child ``index``; leaves
+        produce no edges. ``trace_order`` echoes the trace ids in input
+        order. Raises ValueError (VisualizationError) on any invalid input;
+        the request is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise VisualizationError("request must be a JSON object")
+        if "tree" not in request:
+            raise VisualizationError("request is missing 'tree'")
+        tree = request["tree"]
+        trace = request.get("trace", [])
+        if not isinstance(trace, list):
+            raise VisualizationError("trace must be a list")
+
+        try:
+            _validate_node(tree, "root", set())
+        except TreeError as exc:
+            raise VisualizationError(str(exc)) from exc
+
+        # Depth-first preorder: root first, children in declaration order.
+        nodes: list[dict] = []
+        children_by_id: dict[str, list[str]] = {}
+        type_by_id: dict[str, str] = {}
+
+        def walk(node: dict, depth: int) -> None:
+            node_id = node["id"]
+            node_type = node["type"]
+            type_by_id[node_id] = node_type
+            nodes.append({"id": node_id, "type": node_type, "depth": depth})
+            child_ids: list[str] = []
+            if node_type in _COMPOSITE_TYPES:
+                for child in node.get("children", []):
+                    child_ids.append(child["id"])
+            children_by_id[node_id] = child_ids
+            if node_type in _COMPOSITE_TYPES:
+                for child in node.get("children", []):
+                    walk(child, depth + 1)
+
+        walk(tree, 0)
+
+        status_by_id: dict[str, str] = {}
+        for index, entry in enumerate(trace):
+            where = f"trace entry at trace[{index}]"
+            if not isinstance(entry, dict):
+                raise VisualizationError(f"{where} must be an object")
+            entry_id = entry.get("id")
+            if not _is_valid_key(entry_id):
+                raise VisualizationError(f"{where} requires a non-empty string id")
+            if entry_id in status_by_id:
+                raise VisualizationError(f"duplicate trace id {entry_id!r}")
+            if entry_id not in type_by_id:
+                raise VisualizationError(f"{where} references unknown node {entry_id!r}")
+            if entry.get("type") != type_by_id[entry_id]:
+                raise VisualizationError(
+                    f"{where}: type does not match node {entry_id!r}"
+                )
+            entry_status = entry.get("status")
+            if entry_status not in STATUSES:
+                raise VisualizationError(f"{where}: illegal status {entry_status!r}")
+            status_by_id[entry_id] = entry_status
+
+        for node_info in nodes:
+            traced = status_by_id.get(node_info["id"])
+            node_info["visited"] = traced is not None
+            node_info["status"] = traced
+
+        edges: list[dict] = []
+        for node_info in nodes:
+            for index, child_id in enumerate(children_by_id[node_info["id"]]):
+                edges.append({"from": node_info["id"], "to": child_id, "index": index})
+
+        return {
+            "status": "EXPORTED",
+            "nodes": nodes,
+            "edges": edges,
+            "trace_order": [entry["id"] for entry in trace],
+        }
 
     def step_state_machine(self, request: dict) -> dict:
         """Advance ``request['machine']`` by exactly one ``request['event']``.
