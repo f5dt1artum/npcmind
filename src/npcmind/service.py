@@ -14,7 +14,9 @@ context once and picks the best; each ``update_perception`` call validates
 the supplied memory and observations once and returns the merged memory;
 each ``select_avoidance`` call predicts disc collisions for the supplied
 candidate velocities over one time horizon and picks one admissible
-velocity. No state is kept between calls.
+velocity; each ``select_attention`` call scores the supplied memory
+records against the supplied observer once and picks the most salient
+target. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -59,6 +61,10 @@ class PerceptionError(ValueError):
 
 class SteeringError(ValueError):
     """Raised when a local-avoidance steering request fails validation."""
+
+
+class AttentionError(ValueError):
+    """Raised when an attention-selection request fails validation."""
 
 
 _UTILITY_CURVES = ("linear", "inverse")
@@ -381,52 +387,59 @@ def _goap_conditions_met(conditions: dict, state: dict) -> bool:
     return all(key in state and _json_equal(state[key], value) for key, value in conditions.items())
 
 
-def _validate_perception_json(value: Any, where: str) -> None:
+def _validate_perception_json(value: Any, where: str, error: type = PerceptionError) -> None:
     """Ensure ``value`` is a legal JSON value with no non-finite numbers."""
     if value is None or isinstance(value, (str, bool, int)):
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise PerceptionError(f"{where}: non-finite number is not a legal JSON value")
+            raise error(f"{where}: non-finite number is not a legal JSON value")
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
-            _validate_perception_json(item, f"{where}[{index}]")
+            _validate_perception_json(item, f"{where}[{index}]", error)
         return
     if isinstance(value, dict):
         for key, item in value.items():
             if not isinstance(key, str):
-                raise PerceptionError(f"{where}: object key {key!r} must be a string")
-            _validate_perception_json(item, f"{where}.{key}")
+                raise error(f"{where}: object key {key!r} must be a string")
+            _validate_perception_json(item, f"{where}.{key}", error)
         return
-    raise PerceptionError(f"{where}: {type(value).__name__} is not a legal JSON value")
+    raise error(f"{where}: {type(value).__name__} is not a legal JSON value")
 
 
-def _validate_perception_entity(entity: Any, where: str, now: float, *, last_seen_required: bool) -> dict:
+def _validate_perception_entity(
+    entity: Any,
+    where: str,
+    now: float,
+    *,
+    last_seen_required: bool,
+    error: type = PerceptionError,
+) -> dict:
     """Validate one memory entity or observation; return a normalised copy."""
     if not isinstance(entity, dict):
-        raise PerceptionError(f"{where} must be an object")
+        raise error(f"{where} must be an object")
     entity_id = entity.get("id")
     if not _is_valid_key(entity_id):
-        raise PerceptionError(f"{where} requires a non-empty string id")
+        raise error(f"{where} requires a non-empty string id")
     kind = entity.get("kind")
     if not _is_valid_key(kind):
-        raise PerceptionError(f"{where} requires a non-empty string kind")
+        raise error(f"{where} requires a non-empty string kind")
     confidence = entity.get("confidence")
     if not _is_finite_number(confidence) or not 0 <= confidence <= 1:
-        raise PerceptionError(f"{where}: confidence must be a finite number between 0 and 1")
+        raise error(f"{where}: confidence must be a finite number between 0 and 1")
     position = entity.get("position")
     if not isinstance(position, dict):
-        raise PerceptionError(f"{where}: position must be an object")
+        raise error(f"{where}: position must be an object")
     if "x" not in position or not _is_finite_number(position["x"]):
-        raise PerceptionError(f"{where}: position.x must be a finite number")
+        raise error(f"{where}: position.x must be a finite number")
     if "y" not in position or not _is_finite_number(position["y"]):
-        raise PerceptionError(f"{where}: position.y must be a finite number")
+        raise error(f"{where}: position.y must be a finite number")
     if "data" in entity:
         data = entity["data"]
         if not isinstance(data, dict):
-            raise PerceptionError(f"{where}: data must be an object")
-        _validate_perception_json(data, f"{where}.data")
+            raise error(f"{where}: data must be an object")
+        _validate_perception_json(data, f"{where}.data", error)
     else:
         data = {}
     parsed = {
@@ -439,25 +452,25 @@ def _validate_perception_entity(entity: Any, where: str, now: float, *, last_see
     if last_seen_required:
         last_seen = entity.get("last_seen")
         if not _is_finite_number(last_seen) or last_seen < 0:
-            raise PerceptionError(f"{where}: last_seen must be a non-negative finite number")
+            raise error(f"{where}: last_seen must be a non-negative finite number")
         if last_seen > now:
-            raise PerceptionError(f"{where}: last_seen must not be later than now")
+            raise error(f"{where}: last_seen must not be later than now")
         parsed["last_seen"] = last_seen
     return parsed
 
 
-def _validate_vector(value: Any, where: str) -> tuple[float, float]:
+def _validate_vector(value: Any, where: str, error: type = SteeringError) -> tuple[float, float]:
     """Validate ``{"x": finite, "y": finite}``; booleans are not numbers."""
     if not isinstance(value, dict):
-        raise SteeringError(f"{where} must be an object")
+        raise error(f"{where} must be an object")
     if "x" not in value or "y" not in value:
-        raise SteeringError(f"{where} requires finite-number fields x and y")
+        raise error(f"{where} requires finite-number fields x and y")
     x = value["x"]
     y = value["y"]
     if not _is_finite_number(x):
-        raise SteeringError(f"{where}.x must be a finite number")
+        raise error(f"{where}.x must be a finite number")
     if not _is_finite_number(y):
-        raise SteeringError(f"{where}.y must be a finite number")
+        raise error(f"{where}.y must be a finite number")
     return float(x), float(y)
 
 
@@ -491,7 +504,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention."""
     name = "npcmind"
     version = __version__
 
@@ -1128,5 +1141,145 @@ class Service:
             "status": "SELECTED",
             "selected": selected_id,
             "velocity": selected_velocity,
+            "evaluations": evaluations,
+        }
+
+    def select_attention(self, request: Any) -> dict:
+        """Score memory records for salience and pick the strongest target.
+
+        The request is validated in full before any record is evaluated.
+        ``observer`` carries a finite ``position`` vector, a non-zero finite
+        ``forward`` vector, a positive finite ``max_distance`` and a
+        ``field_of_view_degrees`` in ``(0, 360]``; ``now`` is a non-negative
+        finite number and ``memory_horizon`` a positive finite number.
+        ``memory`` follows the perception-entry record constraints (unique
+        non-empty string ``id``, non-empty string ``kind``, ``last_seen``
+        non-negative and no later than ``now``, ``confidence`` in
+        ``[0, 1]``, finite ``position`` ``x``/``y``, optional JSON object
+        ``data``) and may be empty; ``data.threat`` defaults to ``0`` and,
+        when present, must be a finite number in ``[0, 1]``.
+
+        Records are evaluated in their original order. An entity coincident
+        with the observer is visible with ``proximity`` 1; otherwise it is
+        visible only when its distance does not exceed ``max_distance`` and
+        the angle between its direction and ``forward`` does not exceed half
+        the field of view (a 360-degree field imposes no orientation limit;
+        either boundary counts as visible). A visible entity's ``proximity``
+        is ``max(0, 1 - distance / max_distance)``; ``freshness`` is
+        ``max(0, 1 - (now - last_seen) / memory_horizon)``; a visible
+        entity's ``score`` is the product of ``confidence``, ``threat``,
+        ``proximity`` and ``freshness``, while an invisible entity scores 0.
+        ``evaluations`` lists every record in input order with its ``id``,
+        ``visible``, ``distance``, ``threat``, ``proximity``, ``freshness``
+        and ``score``. The highest positive score wins, ties going to the
+        record listed first; a winner yields ``SELECTED`` with its id and
+        score, otherwise ``NO_TARGET`` with null ``selected`` and ``score``.
+        Raises ValueError (AttentionError) on any invalid input; the request
+        is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise AttentionError("request must be a JSON object")
+        observer = request.get("observer")
+        if not isinstance(observer, dict):
+            raise AttentionError("observer must be an object")
+        if "position" not in observer:
+            raise AttentionError("observer is missing 'position'")
+        if "forward" not in observer:
+            raise AttentionError("observer is missing 'forward'")
+        position = _validate_vector(observer["position"], "observer.position", AttentionError)
+        forward = _validate_vector(observer["forward"], "observer.forward", AttentionError)
+        if forward == (0.0, 0.0):
+            raise AttentionError("observer.forward must be a non-zero vector")
+        max_distance = observer.get("max_distance")
+        if not _is_finite_number(max_distance) or max_distance <= 0:
+            raise AttentionError("observer.max_distance must be a positive finite number")
+        field_of_view = observer.get("field_of_view_degrees")
+        if not _is_finite_number(field_of_view) or not 0 < field_of_view <= 360:
+            raise AttentionError(
+                "observer.field_of_view_degrees must be a finite number in (0, 360]"
+            )
+        now = request.get("now")
+        if not _is_finite_number(now) or now < 0:
+            raise AttentionError("now must be a non-negative finite number")
+        memory_horizon = request.get("memory_horizon")
+        if not _is_finite_number(memory_horizon) or memory_horizon <= 0:
+            raise AttentionError("memory_horizon must be a positive finite number")
+        memory = request.get("memory")
+        if not isinstance(memory, list):
+            raise AttentionError("memory must be a list")
+
+        parsed_memory: list[dict] = []
+        memory_ids: set[str] = set()
+        for index, entity in enumerate(memory):
+            where = f"memory[{index}]"
+            parsed = _validate_perception_entity(
+                entity, where, now, last_seen_required=True, error=AttentionError
+            )
+            threat = parsed["data"].get("threat", 0)
+            if not _is_finite_number(threat) or not 0 <= threat <= 1:
+                raise AttentionError(
+                    f"{where}: data.threat must be a finite number between 0 and 1"
+                )
+            if parsed["id"] in memory_ids:
+                raise AttentionError(f"duplicate memory id {parsed['id']!r}")
+            memory_ids.add(parsed["id"])
+            parsed["threat"] = threat
+            parsed_memory.append(parsed)
+
+        px, py = position
+        fx, fy = forward
+        full_circle = field_of_view == 360
+        half_fov = math.radians(field_of_view) / 2.0
+        evaluations: list[dict] = []
+        selected: str | None = None
+        selected_score: float | None = None
+        for entity in parsed_memory:
+            dx = entity["position"]["x"] - px
+            dy = entity["position"]["y"] - py
+            distance = math.hypot(dx, dy)
+            if distance == 0.0:
+                # Coincident with the observer: always visible, proximity 1.
+                visible = True
+                proximity = 1.0
+            else:
+                visible = distance <= max_distance
+                if visible and not full_circle:
+                    angle = math.atan2(abs(dx * fy - dy * fx), dx * fx + dy * fy)
+                    visible = angle <= half_fov
+                proximity = max(0.0, 1.0 - distance / max_distance)
+            freshness = max(0.0, 1.0 - (now - entity["last_seen"]) / memory_horizon)
+            threat = entity["threat"]
+            if visible:
+                score = entity["confidence"] * threat * proximity * freshness
+            else:
+                score = 0.0
+            evaluations.append(
+                {
+                    "id": entity["id"],
+                    "visible": visible,
+                    "distance": distance,
+                    "threat": threat,
+                    "proximity": proximity,
+                    "freshness": freshness,
+                    "score": score,
+                }
+            )
+            # Records are visited in input order and the strict comparison
+            # keeps the earliest record on an equal score.
+            if score > 0 and (selected_score is None or score > selected_score):
+                selected = entity["id"]
+                selected_score = score
+
+        if selected is None:
+            return {
+                "status": "NO_TARGET",
+                "selected": None,
+                "score": None,
+                "evaluations": evaluations,
+            }
+        return {
+            "status": "SELECTED",
+            "selected": selected,
+            "score": selected_score,
             "evaluations": evaluations,
         }
