@@ -357,8 +357,29 @@ def _validate_sm_action(action: Any, where: str) -> None:
         raise MachineError(f"{where}: action op 'set' requires a value")
 
 
-def _validate_machine(machine: Any) -> set[str]:
-    """Validate a machine definition fully; return the declared state ids."""
+def _expand_to_leaf(state_id: str, initials: dict[str, str]) -> str:
+    """Follow ``initial`` links from ``state_id`` down to a leaf state."""
+    seen = {state_id}
+    current = state_id
+    while current in initials:
+        current = initials[current]
+        if current in seen:
+            raise MachineError(
+                f"state {state_id!r}: initial expansion does not reach a leaf state"
+            )
+        seen.add(current)
+    return current
+
+
+def _validate_machine(machine: Any) -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """Validate a machine definition fully.
+
+    Returns ``(state_ids, parents, initials)``: the declared state ids, the
+    child-to-parent map, and the composite-state-to-initial-child map. A
+    state given as a plain string or an object with only an ``id`` is a
+    leaf; an object may also name a ``parent`` (its direct parent state)
+    and a composite state must name an ``initial`` direct child.
+    """
     if not isinstance(machine, dict):
         raise MachineError("machine must be an object")
     states = machine.get("states")
@@ -373,9 +394,70 @@ def _validate_machine(machine: Any) -> set[str]:
             raise MachineError(f"duplicate state id {state_id!r}")
         state_ids.add(state_id)
 
+    parents: dict[str, str] = {}
+    declared_initials: dict[str, str] = {}
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        state_id = state["id"]
+        if "parent" in state:
+            parent = state["parent"]
+            if not isinstance(parent, str) or parent not in state_ids:
+                raise MachineError(
+                    f"state {state_id!r}: parent references unknown state {parent!r}"
+                )
+            if parent == state_id:
+                raise MachineError(f"state {state_id!r} must not be its own parent")
+            parents[state_id] = parent
+        if "initial" in state:
+            child = state["initial"]
+            if not isinstance(child, str) or child not in state_ids:
+                raise MachineError(
+                    f"state {state_id!r}: initial references unknown state {child!r}"
+                )
+            declared_initials[state_id] = child
+
+    # Each state has at most one parent (a single ``parent`` field) and the
+    # parent relation must be acyclic: walking upward from any state must
+    # terminate at a root.
+    for state_id in state_ids:
+        seen = {state_id}
+        node = state_id
+        while node in parents:
+            node = parents[node]
+            if node in seen:
+                raise MachineError(f"state {state_id!r}: parent relation forms a cycle")
+            seen.add(node)
+
+    children: dict[str, list[str]] = {state_id: [] for state_id in state_ids}
+    for child_id, parent_id in parents.items():
+        children[parent_id].append(child_id)
+
+    initials: dict[str, str] = {}
+    for state_id in state_ids:
+        if children[state_id]:
+            child = declared_initials.get(state_id)
+            if child is None:
+                raise MachineError(
+                    f"composite state {state_id!r} requires an initial child state"
+                )
+            if parents.get(child) != state_id:
+                raise MachineError(
+                    f"state {state_id!r}: initial {child!r} is not a direct child"
+                )
+            initials[state_id] = child
+        elif state_id in declared_initials:
+            raise MachineError(f"leaf state {state_id!r} must not declare an initial state")
+
     initial = machine.get("initial")
     if not isinstance(initial, str) or initial not in state_ids:
         raise MachineError(f"initial references unknown state {initial!r}")
+    if initial in parents:
+        raise MachineError(f"initial must reference a root state, but {initial!r} has a parent")
+
+    # Following initial links from any composite state must reach a leaf.
+    for state_id in state_ids:
+        _expand_to_leaf(state_id, initials)
 
     transitions = machine.get("transitions")
     if not isinstance(transitions, list):
@@ -405,7 +487,7 @@ def _validate_machine(machine: Any) -> set[str]:
             raise MachineError(f"{where}: actions must be a list")
         for action_index, action in enumerate(actions):
             _validate_sm_action(action, f"{where}.actions[{action_index}]")
-    return state_ids
+    return state_ids, parents, initials
 
 
 def _sm_condition_holds(condition: dict | None, blackboard: dict) -> bool:
@@ -635,11 +717,19 @@ class Service:
         """Advance ``request['machine']`` by exactly one ``request['event']``.
 
         The machine and the request are validated in full before any action
-        runs. The first transition (in declaration order) whose ``from``
-        equals the current state, whose ``event`` matches exactly, and whose
-        condition holds is taken; its actions then run in order. Raises
-        ValueError (MachineError) on any structural problem; a step that
-        matches no transition is not an error.
+        runs. States may form a hierarchy: a state object may name a
+        ``parent`` state, and a composite state (one with children) must
+        name an ``initial`` direct child. ``machine.initial`` must be a root
+        state; an explicit ``current_state`` may name any state. A composite
+        start or target state is expanded along ``initial`` links to its
+        unique leaf. Candidate transitions are sought from the current leaf
+        upward towards the root: a deeper source level is considered as a
+        whole before any parent level, and within one level transitions are
+        checked in declaration order, the first whose ``event`` matches
+        exactly and whose condition holds being taken; its actions then run
+        in order, exactly once. The expansion itself produces no actions and
+        no trace entries. Raises ValueError (MachineError) on any structural
+        problem; a step that matches no transition is not an error.
         """
         if not isinstance(request, dict):
             raise MachineError("request must be a JSON object")
@@ -656,28 +746,42 @@ class Service:
             if not _is_valid_key(key):
                 raise MachineError(f"blackboard key {key!r} must be a non-empty string")
 
-        state_ids = _validate_machine(machine)
+        state_ids, parents, initials = _validate_machine(machine)
 
         current = request.get("current_state", machine["initial"])
         if not isinstance(current, str) or current not in state_ids:
             raise MachineError(f"current_state references unknown state {current!r}")
 
+        # A composite start state expands along initial links to its leaf.
+        start_leaf = _expand_to_leaf(current, initials)
+
+        # Source states are tried from the current leaf up to the root; a
+        # deeper level is exhausted before any ancestor level is considered.
+        chain = [start_leaf]
+        node = start_leaf
+        while node in parents:
+            node = parents[node]
+            chain.append(node)
+
         board = dict(blackboard)
         trace: list = []
         matched = None
-        for transition in machine["transitions"]:
-            if transition["from"] != current or transition["event"] != event:
-                continue
-            holds = _sm_condition_holds(transition.get("condition"), board)
-            trace.append({"id": transition["id"], "condition": holds})
-            if holds:
-                matched = transition
+        for source in chain:
+            for transition in machine["transitions"]:
+                if transition["from"] != source or transition["event"] != event:
+                    continue
+                holds = _sm_condition_holds(transition.get("condition"), board)
+                trace.append({"id": transition["id"], "condition": holds})
+                if holds:
+                    matched = transition
+                    break
+            if matched is not None:
                 break
 
         if matched is None:
             return {
-                "previous_state": current,
-                "state": current,
+                "previous_state": start_leaf,
+                "state": start_leaf,
                 "transition": None,
                 "blackboard": board,
                 "trace": trace,
@@ -689,8 +793,8 @@ class Service:
             else:  # delete
                 board.pop(action["key"], None)
         return {
-            "previous_state": current,
-            "state": matched["to"],
+            "previous_state": start_leaf,
+            "state": _expand_to_leaf(matched["to"], initials),
             "transition": matched["id"],
             "blackboard": board,
             "trace": trace,

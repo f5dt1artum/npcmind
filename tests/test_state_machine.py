@@ -149,6 +149,209 @@ class StepStateMachineTest(unittest.TestCase):
         self.assertEqual(result["transition"], "t")
 
 
+def hierarchical_machine(**overrides):
+    base = {
+        "states": [
+            {"id": "active", "initial": "idle"},
+            {"id": "idle", "parent": "active"},
+            {"id": "walk", "parent": "active"},
+            {"id": "combat", "initial": "melee"},
+            {"id": "melee", "parent": "combat"},
+            {"id": "ranged", "parent": "combat"},
+            "dead",
+        ],
+        "initial": "active",
+        "transitions": [
+            {"id": "t_idle_walk", "from": "idle", "to": "walk", "event": "go"},
+            {
+                "id": "t_active_combat",
+                "from": "active",
+                "to": "combat",
+                "event": "fight",
+                "actions": [{"op": "set", "key": "fighting", "value": True}],
+            },
+            {"id": "t_any_dead", "from": "active", "to": "dead", "event": "die"},
+            {
+                "id": "t_walk_guarded",
+                "from": "walk",
+                "to": "idle",
+                "event": "stop",
+                "condition": {"op": "exists", "key": "tired"},
+            },
+            {"id": "t_active_stop", "from": "active", "to": "idle", "event": "stop"},
+        ],
+    }
+    base.update(overrides)
+    return base
+
+
+class HierarchicalStepTest(unittest.TestCase):
+    def setUp(self):
+        self.service = Service()
+
+    def step(self, request=None, **kwargs):
+        if request is None:
+            request = {"machine": hierarchical_machine(), "event": "go"}
+            request.update(kwargs)
+        return self.service.step_state_machine(request)
+
+    def test_initial_expands_to_leaf(self):
+        result = self.step()
+        self.assertEqual(result["previous_state"], "idle")
+        self.assertEqual(result["state"], "walk")
+        self.assertEqual(result["transition"], "t_idle_walk")
+
+    def test_current_state_may_be_composite(self):
+        result = self.step(current_state="active")
+        self.assertEqual(result["previous_state"], "idle")
+        self.assertEqual(result["state"], "walk")
+
+    def test_composite_target_expands_to_leaf(self):
+        result = self.step(event="fight")
+        self.assertEqual(result["previous_state"], "idle")
+        self.assertEqual(result["state"], "melee")
+        self.assertEqual(result["transition"], "t_active_combat")
+        self.assertEqual(result["blackboard"], {"fighting": True})
+        self.assertEqual(result["trace"], [{"id": "t_active_combat", "condition": True}])
+
+    def test_deeper_level_wins_over_parent_level(self):
+        # "stop" matches both walk (deeper, guarded) and active (ancestor).
+        result = self.step(current_state="walk", event="stop", blackboard={"tired": 1})
+        self.assertEqual(result["transition"], "t_walk_guarded")
+        self.assertEqual(
+            result["trace"],
+            [{"id": "t_walk_guarded", "condition": True}],
+        )
+
+    def test_parent_level_checked_after_deeper_level_fails(self):
+        result = self.step(current_state="walk", event="stop")
+        self.assertEqual(result["transition"], "t_active_stop")
+        self.assertEqual(result["state"], "idle")
+        self.assertEqual(
+            result["trace"],
+            [
+                {"id": "t_walk_guarded", "condition": False},
+                {"id": "t_active_stop", "condition": True},
+            ],
+        )
+
+    def test_no_match_anywhere_keeps_leaf_state_and_blackboard(self):
+        result = self.step(current_state="ranged", event="go", blackboard={"k": 1})
+        self.assertEqual(result["previous_state"], "ranged")
+        self.assertEqual(result["state"], "ranged")
+        self.assertIsNone(result["transition"])
+        self.assertEqual(result["blackboard"], {"k": 1})
+        self.assertEqual(result["trace"], [])
+
+    def test_deep_nesting_expands_through_levels(self):
+        request = {
+            "machine": {
+                "states": [
+                    {"id": "root", "initial": "mid"},
+                    {"id": "mid", "parent": "root", "initial": "leaf"},
+                    {"id": "leaf", "parent": "mid"},
+                    "other",
+                ],
+                "initial": "root",
+                "transitions": [
+                    {"id": "t", "from": "root", "to": "other", "event": "x"},
+                ],
+            },
+            "event": "x",
+        }
+        result = self.step(request)
+        self.assertEqual(result["previous_state"], "leaf")
+        self.assertEqual(result["state"], "other")
+        self.assertEqual(result["transition"], "t")
+
+    def test_inputs_are_not_mutated(self):
+        board = {"tired": 1}
+        request = {
+            "machine": hierarchical_machine(),
+            "event": "stop",
+            "current_state": "walk",
+            "blackboard": board,
+        }
+        self.step(request)
+        self.assertEqual(board, {"tired": 1})
+        self.assertEqual(request["machine"]["states"][0], {"id": "active", "initial": "idle"})
+
+
+class HierarchicalMachineErrorsTest(unittest.TestCase):
+    def setUp(self):
+        self.service = Service()
+
+    def assert_invalid(self, machine, *fragments):
+        with self.assertRaises(ValueError) as ctx:
+            self.service.step_state_machine({"machine": machine, "event": "go"})
+        for fragment in fragments:
+            self.assertIn(fragment, str(ctx.exception))
+
+    def test_parent_unknown(self):
+        self.assert_invalid(
+            hierarchical_machine(states=[{"id": "a", "parent": "ghost"}, "b"], initial="b"),
+            "parent",
+        )
+
+    def test_parent_self(self):
+        self.assert_invalid(
+            hierarchical_machine(states=[{"id": "a", "parent": "a"}], initial="a"),
+            "parent",
+        )
+
+    def test_parent_cycle(self):
+        self.assert_invalid(
+            hierarchical_machine(
+                states=[{"id": "a", "parent": "b"}, {"id": "b", "parent": "a"}],
+                initial="a",
+            ),
+            "cycle",
+        )
+
+    def test_composite_missing_initial(self):
+        self.assert_invalid(
+            hierarchical_machine(states=[{"id": "a"}, {"id": "b", "parent": "a"}], initial="a"),
+            "initial",
+        )
+
+    def test_composite_initial_not_direct_child(self):
+        self.assert_invalid(
+            hierarchical_machine(
+                states=[
+                    {"id": "a", "initial": "c"},
+                    {"id": "b", "parent": "a"},
+                    {"id": "c"},
+                ],
+                initial="a",
+            ),
+            "initial",
+        )
+
+    def test_composite_initial_unknown(self):
+        self.assert_invalid(
+            hierarchical_machine(
+                states=[{"id": "a", "initial": "ghost"}, {"id": "b", "parent": "a"}],
+                initial="a",
+            ),
+            "initial",
+        )
+
+    def test_leaf_declares_initial(self):
+        self.assert_invalid(
+            hierarchical_machine(states=[{"id": "a", "initial": "b"}, "b"], initial="a"),
+            "leaf",
+        )
+
+    def test_machine_initial_not_root(self):
+        self.assert_invalid(
+            hierarchical_machine(
+                states=[{"id": "a", "initial": "b"}, {"id": "b", "parent": "a"}],
+                initial="b",
+            ),
+            "root",
+        )
+
+
 class StepStateMachineErrorsTest(unittest.TestCase):
     def setUp(self):
         self.service = Service()
