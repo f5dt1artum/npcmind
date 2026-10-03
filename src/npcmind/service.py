@@ -17,7 +17,9 @@ candidate velocities over one time horizon and picks one admissible
 velocity; each ``select_attention`` call scores the supplied memory
 entities against the supplied observer once and picks the most salient;
 each ``match_dialogue_intent`` call matches the supplied utterance
-against the supplied rule-based intent patterns once. No state is kept
+against the supplied rule-based intent patterns once. Each
+``select_schedule_activity`` call decides one activity from the supplied
+candidates for the supplied minute and need levels once. No state is kept
 between calls.
 """
 
@@ -72,6 +74,10 @@ class AttentionError(ValueError):
 
 class DialogueError(ValueError):
     """Raised when a dialogue-intent request fails validation."""
+
+
+class ScheduleError(ValueError):
+    """Raised when a schedule-decision request fails validation."""
 
 
 _SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -568,7 +574,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedule."""
     name = "npcmind"
     version = __version__
 
@@ -1474,4 +1480,174 @@ class Service:
             "intent": first[0],
             "slots": first[4],
             "candidates": candidates,
+        }
+
+    def select_schedule_activity(self, request: Any) -> dict:
+        """Decide one schedule/need-driven activity for the current minute.
+
+        The request is validated in full before any decision happens.
+        ``now`` is an integer minute in ``[0, 1439]`` (booleans are not
+        integers); ``needs`` is a non-empty object whose keys are non-empty
+        strings and whose values are finite numbers in ``[0, 1]``;
+        ``activities`` is a non-empty list. Each activity requires a unique
+        non-empty string ``id``, integer ``start_minute``/``end_minute`` in
+        ``[0, 1439]``, an optional integer ``priority`` (default ``0``) and
+        an optional ``need`` naming a declared need; an activity with a
+        ``need`` must also carry finite ``trigger``/``relief`` values in
+        ``[0, 1]``.
+
+        The schedule window is start-inclusive and end-exclusive: a start
+        below the end is a same-day interval, a start above the end wraps
+        past midnight, and equal bounds mean the whole day. An activity is
+        eligible when the current minute lies in its window or, for need
+        activities, when the need value is at least ``trigger``; the latter
+        counts as urgent. Urgent activities always beat merely-scheduled
+        ones; urgent ties resolve by higher need value, then higher
+        ``priority``, then input order; scheduled ties resolve by higher
+        ``priority`` and then input order. Selecting an activity lowers only
+        its associated need to ``max(0, value - relief)``; needless
+        activities change nothing. Returns ``SELECTED`` with the id, the
+        updated ``needs`` and per-activity ``evaluations`` (``scheduled``,
+        ``urgent``, ``eligible``, ``need_level``) in input order; with
+        nothing eligible the result is ``IDLE`` with null ``selected``, the
+        original ``needs`` and the full evaluations. Raises ValueError
+        (ScheduleError) on any invalid input; the request is never mutated
+        and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise ScheduleError("request must be a JSON object")
+
+        for field in ("now", "needs", "activities"):
+            if field not in request:
+                raise ScheduleError(f"request is missing {field!r}")
+
+        now = request["now"]
+        if isinstance(now, bool) or not isinstance(now, int) or not 0 <= now <= 1439:
+            raise ScheduleError("now must be an integer between 0 and 1439")
+
+        needs_in = request["needs"]
+        if not isinstance(needs_in, dict) or not needs_in:
+            raise ScheduleError("needs must be a non-empty object")
+        needs: dict[str, Any] = {}
+        for key, value in needs_in.items():
+            if not _is_valid_key(key):
+                raise ScheduleError(f"needs key {key!r} must be a non-empty string")
+            if not _is_finite_number(value) or not 0 <= value <= 1:
+                raise ScheduleError(
+                    f"needs[{key!r}] must be a finite number between 0 and 1"
+                )
+            needs[key] = value
+
+        activities_in = request["activities"]
+        if not isinstance(activities_in, list) or not activities_in:
+            raise ScheduleError("activities must be a non-empty list")
+
+        parsed_activities: list[tuple[str, int, int, int, str | None, Any, Any]] = []
+        seen_ids: set[str] = set()
+        for index, activity in enumerate(activities_in):
+            where = f"activity at activities[{index}]"
+            if not isinstance(activity, dict):
+                raise ScheduleError(f"{where} must be an object")
+            activity_id = activity.get("id")
+            if not _is_valid_key(activity_id):
+                raise ScheduleError(f"{where} requires a non-empty string id")
+            if activity_id in seen_ids:
+                raise ScheduleError(f"duplicate activity id {activity_id!r}")
+            seen_ids.add(activity_id)
+            where = f"activity {activity_id!r}"
+            start = activity.get("start_minute")
+            if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start <= 1439:
+                raise ScheduleError(
+                    f"{where}: start_minute must be an integer between 0 and 1439"
+                )
+            end = activity.get("end_minute")
+            if isinstance(end, bool) or not isinstance(end, int) or not 0 <= end <= 1439:
+                raise ScheduleError(
+                    f"{where}: end_minute must be an integer between 0 and 1439"
+                )
+            priority = activity.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                raise ScheduleError(f"{where}: priority must be an integer")
+            if "need" in activity:
+                need = activity["need"]
+                if not _is_valid_key(need):
+                    raise ScheduleError(f"{where}: need must be a non-empty string")
+                if need not in needs:
+                    raise ScheduleError(
+                        f"{where}: need references an undeclared need {need!r}"
+                    )
+                trigger = activity.get("trigger")
+                if not _is_finite_number(trigger) or not 0 <= trigger <= 1:
+                    raise ScheduleError(
+                        f"{where}: trigger must be a finite number between 0 and 1"
+                    )
+                relief = activity.get("relief")
+                if not _is_finite_number(relief) or not 0 <= relief <= 1:
+                    raise ScheduleError(
+                        f"{where}: relief must be a finite number between 0 and 1"
+                    )
+            else:
+                need = None
+                trigger = None
+                relief = None
+            parsed_activities.append(
+                (activity_id, start, end, priority, need, trigger, relief)
+            )
+
+        def in_window(start: int, end: int) -> bool:
+            if start == end:
+                return True  # equal bounds cover the whole day
+            if start < end:
+                return start <= now < end
+            return now >= start or now < end  # window wraps past midnight
+
+        evaluations: list[dict] = []
+        best_urgent: tuple[tuple[Any, int, int], str, str, Any] | None = None
+        best_scheduled: tuple[int, int, str, str | None, Any] | None = None
+        for order, (activity_id, start, end, priority, need, trigger, relief) in (
+            enumerate(parsed_activities)
+        ):
+            scheduled = in_window(start, end)
+            urgent = need is not None and needs[need] >= trigger
+            evaluations.append(
+                {
+                    "id": activity_id,
+                    "scheduled": scheduled,
+                    "urgent": urgent,
+                    "eligible": scheduled or urgent,
+                    "need_level": needs[need] if need is not None else None,
+                }
+            )
+            if urgent:
+                # Maximise need value, then priority; the -order term keeps the
+                # earliest input activity on an exact tie.
+                ranking = (needs[need], priority, -order)
+                if best_urgent is None or ranking > best_urgent[0]:
+                    best_urgent = (ranking, activity_id, need, relief)
+            elif scheduled:
+                # Activities are visited in input order, so a strictly higher
+                # priority is the only thing that replaces the incumbent.
+                if best_scheduled is None or priority > best_scheduled[0]:
+                    best_scheduled = (priority, order, activity_id, need, relief)
+
+        if best_urgent is None and best_scheduled is None:
+            return {
+                "status": "IDLE",
+                "selected": None,
+                "needs": dict(needs),
+                "evaluations": evaluations,
+            }
+
+        if best_urgent is not None:
+            _, activity_id, need, relief = best_urgent
+        else:
+            _, _, activity_id, need, relief = best_scheduled
+        updated_needs = dict(needs)
+        if need is not None:
+            updated_needs[need] = max(0, needs[need] - relief)
+        return {
+            "status": "SELECTED",
+            "selected": activity_id,
+            "needs": updated_needs,
+            "evaluations": evaluations,
         }

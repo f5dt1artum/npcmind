@@ -34,6 +34,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/steering/avoid": ("select_avoidance", "invalid_steering"),
         "/v1/attention/select": ("select_attention", "invalid_attention"),
         "/v1/dialogue/intents/match": ("match_dialogue_intent", "invalid_dialogue"),
+        "/v1/schedules/decide": ("select_schedule_activity", "invalid_schedule"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:
