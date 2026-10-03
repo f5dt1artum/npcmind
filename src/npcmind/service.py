@@ -30,6 +30,7 @@ No state is kept between calls.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import math
 import re
@@ -40,9 +41,10 @@ from typing import Any
 from . import __version__
 
 STATUSES = ("SUCCESS", "FAILURE", "RUNNING")
-_COMPOSITE_TYPES = ("sequence", "selector")
+_COMPOSITE_TYPES = ("sequence", "selector", "random_selector")
 _CONDITION_OPS = ("exists", "equals", "not_equals")
 _ACTION_OPS = ("set", "delete", "status")
+_MAX_SEED = 18446744073709551615  # 2**64 - 1
 
 
 class TreeError(ValueError):
@@ -267,6 +269,18 @@ def _validate_node(node: Any, path: str, seen_ids: set[str]) -> None:
         children = node.get("children", [])
         if not isinstance(children, list):
             raise TreeError(f"{where}: children must be a list")
+        if node_type == "random_selector":
+            if not children:
+                raise TreeError(f"{where}: children must be a non-empty list")
+            weights = node.get("weights")
+            if weights is not None:
+                if not isinstance(weights, list) or len(weights) != len(children):
+                    raise TreeError(
+                        f"{where}: weights must be a list of one positive integer per child"
+                    )
+                for weight in weights:
+                    if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
+                        raise TreeError(f"{where}: weights must be positive integers")
         for index, child in enumerate(children):
             _validate_node(child, f"{path}.children[{index}]", seen_ids)
     elif node_type == "condition":
@@ -316,20 +330,57 @@ def _run_action(node: dict, blackboard: dict) -> str:
     return node["status"]  # op == "status"
 
 
-def _tick(node: dict, blackboard: dict, trace: list) -> str:
+def _tree_has_random_selector(node: dict) -> bool:
+    """Whether the (already validated) tree contains a random_selector."""
+    if node["type"] == "random_selector":
+        return True
+    if node["type"] in _COMPOSITE_TYPES:
+        return any(_tree_has_random_selector(child) for child in node.get("children", []))
+    return False
+
+
+def _choose_random_child(node: dict, seed: int) -> int:
+    """Deterministically pick one child index of a random_selector.
+
+    The digest input is the seed's decimal text, a half-width colon and the
+    node id, hashed as UTF-8 SHA-256; the first eight digest bytes read as an
+    unsigned big-endian integer are reduced modulo the total weight and the
+    remainder is placed into the first cumulative-weight interval (in
+    ``children`` order) that contains it. Each node uses only its own id, so
+    nested selectors never share or consume a common random stream.
+    """
+    children = node["children"]
+    weights = node.get("weights")
+    if weights is None:
+        weights = [1] * len(children)
+    total = sum(weights)
+    digest = hashlib.sha256(f"{seed}:{node['id']}".encode("utf-8")).digest()
+    remainder = int.from_bytes(digest[:8], "big") % total
+    cumulative = 0
+    for index, weight in enumerate(weights):
+        cumulative += weight
+        if remainder < cumulative:
+            return index
+    return len(children) - 1  # unreachable: remainder < total
+
+
+def _tick(node: dict, blackboard: dict, trace: list, seed: int | None = None) -> str:
     node_type = node["type"]
     if node_type == "sequence":
         status = "SUCCESS"
         for child in node.get("children", []):
-            status = _tick(child, blackboard, trace)
+            status = _tick(child, blackboard, trace, seed)
             if status != "SUCCESS":
                 break
     elif node_type == "selector":
         status = "FAILURE"
         for child in node.get("children", []):
-            status = _tick(child, blackboard, trace)
+            status = _tick(child, blackboard, trace, seed)
             if status != "FAILURE":
                 break
+    elif node_type == "random_selector":
+        index = _choose_random_child(node, seed)
+        status = _tick(node["children"][index], blackboard, trace, seed)
     elif node_type == "condition":
         status = _run_condition(node, blackboard)
     else:  # action
@@ -696,8 +747,15 @@ class Service:
     def evaluate_behavior(self, request: dict) -> dict:
         """Execute one tick of ``request['tree']`` against the blackboard.
 
-        Raises ValueError (TreeError) when the request structure, the tree,
-        or the blackboard is invalid; no partial result is produced.
+        A ``random_selector`` node runs exactly one direct child, chosen
+        deterministically from ``request['seed']`` (an integer in
+        ``[0, 2**64 - 1]``, required whenever the tree contains such a node)
+        and the node's own id; the selector's status is the child's status
+        and unchosen branches neither run nor appear in the trace. A tree
+        without ``random_selector`` ignores ``seed`` entirely, so legacy
+        requests are unaffected. Raises ValueError (TreeError) when the
+        request structure, the tree, the blackboard or the seed is invalid;
+        no partial result is produced.
         """
         if not isinstance(request, dict):
             raise TreeError("request must be a JSON object")
@@ -713,9 +771,19 @@ class Service:
 
         _validate_node(tree, "root", set())
 
+        seed = None
+        if _tree_has_random_selector(tree):
+            if "seed" not in request:
+                raise TreeError("request is missing 'seed' required by random_selector")
+            seed = request["seed"]
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise TreeError("seed must be an integer")
+            if not 0 <= seed <= _MAX_SEED:
+                raise TreeError(f"seed must be between 0 and {_MAX_SEED}")
+
         board = dict(blackboard)
         trace: list = []
-        status = _tick(tree, board, trace)
+        status = _tick(tree, board, trace, seed)
         return {"status": status, "blackboard": board, "trace": trace}
 
     def export_behavior_tree(self, request: Any) -> dict:
