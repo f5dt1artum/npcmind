@@ -11,8 +11,10 @@ supplied world state to the supplied goal; each ``find_path`` call searches
 a one-shot grid request for a minimum-cost orthogonal route; each
 ``select_utility`` call scores the supplied options against the supplied
 context once and picks the best; each ``update_perception`` call validates
-the supplied memory and observations once and returns the merged memory. No
-state is kept between calls.
+the supplied memory and observations once and returns the merged memory;
+each ``select_avoidance`` call predicts disc collisions for the supplied
+candidate velocities over one time horizon and picks one admissible
+velocity. No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -55,11 +57,20 @@ class PerceptionError(ValueError):
     """Raised when a perception-memory request fails validation."""
 
 
+class SteeringError(ValueError):
+    """Raised when a local-avoidance steering request fails validation."""
+
+
 _UTILITY_CURVES = ("linear", "inverse")
 
 
 def _is_finite_number(value: Any) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False  # integer too large to represent as a finite double
 
 
 def _validate_utility_consideration(consideration: Any, where: str) -> None:
@@ -435,8 +446,52 @@ def _validate_perception_entity(entity: Any, where: str, now: float, *, last_see
     return parsed
 
 
+def _validate_vector(value: Any, where: str) -> tuple[float, float]:
+    """Validate ``{"x": finite, "y": finite}``; booleans are not numbers."""
+    if not isinstance(value, dict):
+        raise SteeringError(f"{where} must be an object")
+    if "x" not in value or "y" not in value:
+        raise SteeringError(f"{where} requires finite-number fields x and y")
+    x = value["x"]
+    y = value["y"]
+    if not _is_finite_number(x):
+        raise SteeringError(f"{where}.x must be a finite number")
+    if not _is_finite_number(y):
+        raise SteeringError(f"{where}.y must be a finite number")
+    return float(x), float(y)
+
+
+def _disc_collides(
+    rel_pos: tuple[float, float],
+    rel_vel: tuple[float, float],
+    radius_sum: float,
+    horizon: float,
+) -> bool:
+    """Whether two discs touch within ``[0, horizon]`` under linear motion.
+
+    The other disc moves at ``rel_vel`` relative to the agent; ``rel_pos`` is
+    the other centre relative to the agent at ``t = 0``. Squared centre
+    distance along the trajectory is a convex quadratic in ``t``, so over the
+    closed interval its minimum is at the closest-approach time clamped to
+    ``[0, horizon]``; touching (distance equal to the radius sum), including at
+    either endpoint, counts.
+    """
+    px, py = rel_pos
+    vx, vy = rel_vel
+    speed_sq = vx * vx + vy * vy
+    if speed_sq == 0.0:
+        return px * px + py * py <= radius_sum * radius_sum
+    closest_time = -(px * vx + py * vy) / speed_sq
+    if closest_time > horizon:
+        closest_time = horizon
+    if closest_time > 0.0:
+        px += vx * closest_time
+        py += vy * closest_time
+    return px * px + py * py <= radius_sum * radius_sum
+
+
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering."""
     name = "npcmind"
     version = __version__
 
@@ -907,4 +962,171 @@ class Service:
             "memory": merged,
             "seen": [entity["id"] for entity in parsed_observations],
             "forgotten": forgotten,
+        }
+
+    def select_avoidance(self, request: Any) -> dict:
+        """Pick one admissible candidate velocity for local obstacle avoidance.
+
+        The request is validated in full before any candidate is evaluated.
+        The agent has a finite ``position`` vector, a positive finite
+        ``radius``, a non-negative finite ``max_speed``, a finite
+        ``desired_velocity`` vector, a positive finite ``time_horizon``, and a
+        non-empty ``candidates`` list; each candidate has a unique non-empty
+        string ``id`` and a finite ``velocity`` vector. ``neighbors`` are
+        moving discs (``position``, positive finite ``radius``, finite
+        ``velocity``) and ``obstacles`` static discs (``position``, positive
+        finite ``radius``); their ids are unique across the two lists.
+
+        Every candidate is advanced as a constant straight-line velocity; a
+        collision is predicted when the agent centre and an object centre come
+        within the radius sum at any time in the closed interval
+        ``[0, time_horizon]``. A candidate is admissible only when its speed
+        does not exceed ``max_speed`` and it predicts no collision. Among the
+        admissible candidates the one closest to ``desired_velocity`` wins,
+        ties going to the candidate listed first; with none admissible the
+        result is ``BLOCKED`` with null ``selected`` and a zero ``velocity``.
+        ``evaluations`` always lists every candidate in input order, each with
+        ``speed_ok``, ``collision_ids`` (neighbours first, then obstacles) and
+        ``admissible``. Raises ValueError (SteeringError) on any invalid
+        input; the request is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise SteeringError("request must be a JSON object")
+
+        for field in (
+            "position",
+            "radius",
+            "max_speed",
+            "desired_velocity",
+            "time_horizon",
+            "candidates",
+        ):
+            if field not in request:
+                raise SteeringError(f"request is missing {field!r}")
+
+        agent_pos = _validate_vector(request["position"], "position")
+        radius = request["radius"]
+        if not _is_finite_number(radius) or radius <= 0:
+            raise SteeringError("radius must be a positive finite number")
+        max_speed = request["max_speed"]
+        if not _is_finite_number(max_speed) or max_speed < 0:
+            raise SteeringError("max_speed must be a non-negative finite number")
+        desired_velocity = _validate_vector(request["desired_velocity"], "desired_velocity")
+        horizon = request["time_horizon"]
+        if not _is_finite_number(horizon) or horizon <= 0:
+            raise SteeringError("time_horizon must be a positive finite number")
+        candidates = request["candidates"]
+        if not isinstance(candidates, list) or not candidates:
+            raise SteeringError("candidates must be a non-empty list")
+
+        neighbors_in = request.get("neighbors", [])
+        if not isinstance(neighbors_in, list):
+            raise SteeringError("neighbors must be a list")
+        obstacles_in = request.get("obstacles", [])
+        if not isinstance(obstacles_in, list):
+            raise SteeringError("obstacles must be a list")
+
+        parsed_candidates: list[tuple[str, tuple[float, float], Any, Any]] = []
+        candidate_ids: set[str] = set()
+        for index, candidate in enumerate(candidates):
+            where = f"candidate at candidates[{index}]"
+            if not isinstance(candidate, dict):
+                raise SteeringError(f"{where} must be an object")
+            candidate_id = candidate.get("id")
+            if not _is_valid_key(candidate_id):
+                raise SteeringError(f"{where} requires a non-empty string id")
+            if candidate_id in candidate_ids:
+                raise SteeringError(f"duplicate candidate id {candidate_id!r}")
+            candidate_ids.add(candidate_id)
+            if "velocity" not in candidate:
+                raise SteeringError(f"{where} is missing 'velocity'")
+            raw_velocity = candidate["velocity"]
+            velocity = _validate_vector(raw_velocity, f"{where} velocity")
+            # Keep the original numeric values so the selected velocity is
+            # echoed verbatim (integers stay integers).
+            parsed_candidates.append(
+                (candidate_id, velocity, raw_velocity["x"], raw_velocity["y"])
+            )
+
+        # (id, relative position, relative velocity, radius sum); objects keep
+        # their list order, neighbours ahead of obstacles, so collision ids
+        # naturally emit in the required ordering.
+        objects: list[tuple[str, tuple[float, float], tuple[float, float], float]] = []
+        object_ids: set[str] = set()
+
+        def parse_object(item: Any, index: int, kind: str, moving: bool) -> None:
+            where = f"{kind[:-1]} at {kind}[{index}]"
+            if not isinstance(item, dict):
+                raise SteeringError(f"{where} must be an object")
+            object_id = item.get("id")
+            if not _is_valid_key(object_id):
+                raise SteeringError(f"{where} requires a non-empty string id")
+            if object_id in object_ids:
+                raise SteeringError(f"duplicate {kind[:-1]} id {object_id!r}")
+            object_ids.add(object_id)
+            pos = _validate_vector(item.get("position"), f"{where} position")
+            obj_radius = item.get("radius")
+            if not _is_finite_number(obj_radius) or obj_radius <= 0:
+                raise SteeringError(f"{where} radius must be a positive finite number")
+            if moving:
+                if "velocity" not in item:
+                    raise SteeringError(f"{where} is missing 'velocity'")
+                vel = _validate_vector(item["velocity"], f"{where} velocity")
+            else:
+                # Obstacles are static; any extra fields (including a stray
+                # velocity) are ignored rather than treated as motion.
+                vel = (0.0, 0.0)
+            rel_pos = (pos[0] - agent_pos[0], pos[1] - agent_pos[1])
+            objects.append((object_id, rel_pos, vel, float(radius) + float(obj_radius)))
+
+        for index, item in enumerate(neighbors_in):
+            parse_object(item, index, "neighbors", True)
+        for index, item in enumerate(obstacles_in):
+            parse_object(item, index, "obstacles", False)
+
+        evaluations: list[dict] = []
+        selected_id: str | None = None
+        selected_velocity: dict | None = None
+        best_distance: float | None = None
+        for candidate_id, velocity, raw_x, raw_y in parsed_candidates:
+            speed_ok = math.hypot(velocity[0], velocity[1]) <= float(max_speed)
+            collision_ids: list[str] = []
+            for object_id, rel_pos, obj_vel, radius_sum in objects:
+                relative_velocity = (obj_vel[0] - velocity[0], obj_vel[1] - velocity[1])
+                if _disc_collides(rel_pos, relative_velocity, radius_sum, float(horizon)):
+                    collision_ids.append(object_id)
+            admissible = speed_ok and not collision_ids
+            evaluations.append(
+                {
+                    "id": candidate_id,
+                    "speed_ok": speed_ok,
+                    "collision_ids": collision_ids,
+                    "admissible": admissible,
+                }
+            )
+            if admissible:
+                dx = velocity[0] - desired_velocity[0]
+                dy = velocity[1] - desired_velocity[1]
+                distance = math.hypot(dx, dy)
+                # Candidates are visited in input order and the strict
+                # comparison keeps the first one on an equal distance.
+                if best_distance is None or distance < best_distance:
+                    best_distance = distance
+                    selected_id = candidate_id
+                    # New dict holding the original numeric values so the
+                    # velocity is echoed verbatim without aliasing the request.
+                    selected_velocity = {"x": raw_x, "y": raw_y}
+
+        if selected_id is None:
+            return {
+                "status": "BLOCKED",
+                "selected": None,
+                "velocity": {"x": 0, "y": 0},
+                "evaluations": evaluations,
+            }
+        return {
+            "status": "SELECTED",
+            "selected": selected_id,
+            "velocity": selected_velocity,
+            "evaluations": evaluations,
         }

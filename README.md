@@ -22,10 +22,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/perception/memory` 执行一次性感知记忆更新：请求体为 `{"now": 10.0, "retention": 5.0, "memory": [...], "observations": [...]}`。`now` 是非负有限数，`retention` 是正有限数。`memory` 每项含唯一非空字符串 `id`、非空字符串 `kind`、不晚于 `now` 的非负有限数 `last_seen`、零到一之间的 `confidence`、含有限数 `x`/`y` 的 `position`，以及可省略的 JSON 对象 `data`（省略视为空对象）；`observations` 每项结构相同但不含 `last_seen`，且 id 在数组内唯一。请求在合并前完整校验：memory 或 observations 内部 id 重复、必填字段缺失、布尔值冒充数字、数值非有限、`confidence` 越界、`last_seen` 来自未来、`position` 非法或 `data` 含非 JSON 值时整体失败，返回 422 `invalid_perception`，不返回部分结果；Python 侧等价入口 `Service.update_perception(request)` 抛出 `ValueError`。已有实体再次被观察时，用 observation 替换其 `kind`、`confidence`、`position` 与 `data`，`last_seen` 设为 `now`，并保留其在旧记忆中的位置；新实体按 observations 顺序追加。未被观察的旧记录在 `now - last_seen` 大于或等于 `retention` 时遗忘，否则原样保留。返回 `status` 为 `UPDATED`、更新后的 `memory`（每条记录均显式带有 `data`）、按观察输入顺序排列的 `seen` id 数组，以及按旧记忆顺序排列的 `forgotten` id 数组；重新观察的 id 不会出现在 `forgotten` 中。调用不修改传入的请求及其嵌套对象，也不保存跨请求状态。
 
+`POST /v1/steering/avoid` 执行一次性局部避障选速：请求体为 `{"position": {"x": 0.0, "y": 0.0}, "radius": 1.0, "max_speed": 10.0, "desired_velocity": {"x": 1.0, "y": 0.0}, "time_horizon": 1.0, "candidates": [{"id": "go", "velocity": {"x": 1.0, "y": 0.0}}], "neighbors": [...], "obstacles": [...]}`（`neighbors` 与 `obstacles` 可省略，视为空数组）。代理、邻居与障碍均为二维圆盘：位置与速度为含有限数 `x`/`y` 的对象，半径为正有限数；代理的 `max_speed` 为非负有限数，`time_horizon` 为正有限数。邻居含当前 `velocity`，障碍静止；两类对象各自带非空字符串 `id`，且 id 在邻居与障碍合并范围内唯一。`candidates` 是非空数组，每项含唯一非空字符串 `id` 与有限 `velocity` 向量。对每个候选按其速度作匀速直线预测：在闭区间 `[0, time_horizon]` 内任一时刻（含端点，恰好相切也算）代理与对象的圆心距离小于或等于半径之和即判定碰撞。仅当候选速度长度不超过 `max_speed` 且没有预测碰撞时才可采用。返回的 `evaluations` 按候选顺序给出每项的 `id`、`speed_ok`、`collision_ids` 与 `admissible`，其中 `collision_ids` 先按邻居顺序再按障碍顺序排列。存在可采用候选时返回 `status` 为 `SELECTED`、选中的 `selected` id 和原样 `velocity`（整数保持整数），选择规则为与 `desired_velocity` 欧氏距离最小，距离相同取靠前者；否则返回 `status` 为 `BLOCKED`、`selected` 为 `null`、`velocity` 为 `{"x": 0, "y": 0}`，并保留全部 `evaluations`。请求在评估前完整校验：请求不是对象、缺少必填字段、集合类型错误、id 非法或重复、数值含布尔值或非有限值、半径或时域不为正、最大速度为负、向量结构非法时整体失败，返回 422 `invalid_steering`，不返回部分结果；JSON 无法解析仍返回 400 `invalid_json`。Python 侧等价入口为 `Service.select_avoidance(request)`，同类错误抛出 `ValueError`。调用不保存场景状态，也不修改传入的请求及其嵌套对象。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策与一次性感知记忆更新；避障、对话意图、难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策、一次性感知记忆更新与一次性局部避障选速；对话意图、难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。

@@ -31,6 +31,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/navigation/path": ("find_path", "invalid_navigation"),
         "/v1/utility/select": ("select_utility", "invalid_utility"),
         "/v1/perception/memory": ("update_perception", "invalid_perception"),
+        "/v1/steering/avoid": ("select_avoidance", "invalid_steering"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:
