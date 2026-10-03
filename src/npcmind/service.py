@@ -17,8 +17,10 @@ candidate velocities over one time horizon and picks one admissible
 velocity; each ``select_attention`` call scores the supplied memory
 entities against the supplied observer once and picks the most salient;
 each ``match_dialogue_intent`` call matches the supplied utterance
-against the supplied rule-based intent patterns once. No state is kept
-between calls.
+against the supplied rule-based intent patterns once; each
+``select_schedule_activity`` call evaluates the supplied activities
+against the supplied minute and need levels once and picks at most one.
+No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -74,7 +76,24 @@ class DialogueError(ValueError):
     """Raised when a dialogue-intent request fails validation."""
 
 
+class ScheduleError(ValueError):
+    """Raised when a schedule-decision request fails validation."""
+
+
 _SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _minute_in_window(now: int, start: int, end: int) -> bool:
+    """Whether ``now`` lies in the start-inclusive, end-exclusive window.
+
+    A start before the end is a same-day interval, a start after the end
+    wraps past midnight, and equal endpoints cover the whole day.
+    """
+    if start == end:
+        return True
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end
 
 
 def _parse_dialogue_pattern(pattern: Any, where: str) -> list[tuple[str, str]]:
@@ -568,7 +587,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules."""
     name = "npcmind"
     version = __version__
 
@@ -1474,4 +1493,159 @@ class Service:
             "intent": first[0],
             "slots": first[4],
             "candidates": candidates,
+        }
+
+    def select_schedule_activity(self, request: Any) -> dict:
+        """Pick at most one activity for the current minute and need levels.
+
+        The request is validated in full before any activity is evaluated.
+        ``now`` is an integer minute in ``[0, 1439]`` (booleans are not
+        integers); ``needs`` is an object mapping non-empty string keys to
+        finite numbers in ``[0, 1]``; ``activities`` is a non-empty list.
+        Each activity requires a unique non-empty string ``id``, integer
+        ``start_minute``/``end_minute`` in ``[0, 1439]``, an optional
+        integer ``priority`` (default ``0``) and an optional ``need``
+        naming a declared needs key; an activity carrying ``need`` must
+        also provide ``trigger`` and ``relief``, both finite numbers in
+        ``[0, 1]``.
+
+        The schedule window is start-inclusive and end-exclusive: a start
+        before the end is a same-day interval, a start after the end wraps
+        past midnight, and equal endpoints mean the whole day. An activity
+        is ``scheduled`` when ``now`` falls in its window and ``urgent``
+        when it carries a need whose current level is at least ``trigger``;
+        either makes it ``eligible``. Urgent activities always outrank
+        merely scheduled ones: among the urgent, the highest need level
+        wins, then the highest priority, then the earliest input position;
+        among the merely scheduled, the highest priority wins, ties going
+        to the earliest input position. Selecting an activity with a need
+        updates that need to ``max(0, level - relief)``; activities without
+        a need leave the needs untouched.
+
+        The result is ``SELECTED`` with the winning ``selected`` id and the
+        updated ``needs``, or ``IDLE`` with null ``selected`` and the
+        original ``needs`` when nothing is eligible; both carry
+        ``evaluations`` listing every activity in input order with ``id``,
+        ``scheduled``, ``urgent``, ``eligible`` and ``need_level`` (null
+        for activities without a need). Raises ValueError (ScheduleError)
+        on any invalid input; the request is never mutated and no state is
+        kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise ScheduleError("request must be a JSON object")
+        now = request.get("now")
+        if isinstance(now, bool) or not isinstance(now, int) or not 0 <= now <= 1439:
+            raise ScheduleError("now must be an integer between 0 and 1439")
+        needs = request.get("needs")
+        if not isinstance(needs, dict):
+            raise ScheduleError("needs must be an object")
+        for key, value in needs.items():
+            if not _is_valid_key(key):
+                raise ScheduleError(f"needs key {key!r} must be a non-empty string")
+            if not _is_finite_number(value) or not 0 <= value <= 1:
+                raise ScheduleError(f"needs[{key!r}] must be a finite number between 0 and 1")
+        activities = request.get("activities")
+        if not isinstance(activities, list) or not activities:
+            raise ScheduleError("activities must be a non-empty list")
+
+        parsed: list[tuple[str, int, int, int, str | None, float, float]] = []
+        seen_ids: set[str] = set()
+        for index, activity in enumerate(activities):
+            where = f"activity at activities[{index}]"
+            if not isinstance(activity, dict):
+                raise ScheduleError(f"{where} must be an object")
+            activity_id = activity.get("id")
+            if not _is_valid_key(activity_id):
+                raise ScheduleError(f"{where} requires a non-empty string id")
+            if activity_id in seen_ids:
+                raise ScheduleError(f"duplicate activity id {activity_id!r}")
+            seen_ids.add(activity_id)
+            where = f"activity {activity_id!r}"
+            start = activity.get("start_minute")
+            if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start <= 1439:
+                raise ScheduleError(
+                    f"{where}: start_minute must be an integer between 0 and 1439"
+                )
+            end = activity.get("end_minute")
+            if isinstance(end, bool) or not isinstance(end, int) or not 0 <= end <= 1439:
+                raise ScheduleError(
+                    f"{where}: end_minute must be an integer between 0 and 1439"
+                )
+            priority = activity.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                raise ScheduleError(f"{where}: priority must be an integer")
+            need: str | None = None
+            trigger = 0.0
+            relief = 0.0
+            if "need" in activity:
+                need = activity["need"]
+                if not _is_valid_key(need) or need not in needs:
+                    raise ScheduleError(f"{where}: need references unknown need {need!r}")
+                if "trigger" not in activity:
+                    raise ScheduleError(f"{where}: need requires a trigger")
+                trigger = activity["trigger"]
+                if not _is_finite_number(trigger) or not 0 <= trigger <= 1:
+                    raise ScheduleError(
+                        f"{where}: trigger must be a finite number between 0 and 1"
+                    )
+                if "relief" not in activity:
+                    raise ScheduleError(f"{where}: need requires a relief")
+                relief = activity["relief"]
+                if not _is_finite_number(relief) or not 0 <= relief <= 1:
+                    raise ScheduleError(
+                        f"{where}: relief must be a finite number between 0 and 1"
+                    )
+            parsed.append((activity_id, start, end, priority, need, trigger, relief))
+
+        evaluations: list[dict] = []
+        urgent_pool: list[tuple[float, int, int, str, str, float]] = []
+        scheduled_pool: list[tuple[int, int, str, str | None, float]] = []
+        for index, (activity_id, start, end, priority, need, trigger, relief) in enumerate(parsed):
+            scheduled = _minute_in_window(now, start, end)
+            need_level = needs[need] if need is not None else None
+            urgent = need is not None and need_level >= trigger
+            eligible = scheduled or urgent
+            evaluations.append(
+                {
+                    "id": activity_id,
+                    "scheduled": scheduled,
+                    "urgent": urgent,
+                    "eligible": eligible,
+                    "need_level": need_level,
+                }
+            )
+            if urgent:
+                urgent_pool.append((need_level, priority, index, activity_id, need, relief))
+            elif scheduled:
+                scheduled_pool.append((priority, index, activity_id, need, relief))
+
+        selected_id: str | None = None
+        selected_need: str | None = None
+        selected_relief = 0.0
+        if urgent_pool:
+            # Highest need level, then highest priority, then earliest input.
+            _, _, _, selected_id, selected_need, selected_relief = max(
+                urgent_pool, key=lambda entry: (entry[0], entry[1], -entry[2])
+            )
+        elif scheduled_pool:
+            # Highest priority, then earliest input.
+            _, _, selected_id, selected_need, selected_relief = max(
+                scheduled_pool, key=lambda entry: (entry[0], -entry[1])
+            )
+
+        updated_needs = dict(needs)
+        if selected_id is None:
+            return {
+                "status": "IDLE",
+                "selected": None,
+                "needs": updated_needs,
+                "evaluations": evaluations,
+            }
+        if selected_need is not None:
+            updated_needs[selected_need] = max(0, needs[selected_need] - selected_relief)
+        return {
+            "status": "SELECTED",
+            "selected": selected_id,
+            "needs": updated_needs,
+            "evaluations": evaluations,
         }

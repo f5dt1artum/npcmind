@@ -28,10 +28,12 @@ PYTHONPATH=src python3 -m npcmind.server --host 127.0.0.1 --port 8080
 
 `POST /v1/dialogue/intents/match` 执行一次性规则式对话意图匹配：请求体为 `{"utterance": "...", "intents": [...], "context": {...}}`（`context` 可省略，视为空对象）。`utterance` 是归一化后非空的字符串，`intents` 是非空数组；每个意图含唯一非空字符串 `id`、非空 `patterns` 字符串数组、可省略的整数 `priority`（默认 0，布尔值不视为整数），以及可省略的 `requires` 对象。utterance 与 pattern 去除首尾空白后按连续 Unicode 空白分词，比较采用 Unicode casefold，返回的槽值保留 utterance 原文。pattern 的普通词须逐词相等；形如 `{name}` 的完整词（ASCII 字母或下划线开头，后随 ASCII 字母、数字或下划线）是匹配一个词的槽位，同名槽位重复时归一化后的值须相同；pattern 必须覆盖整句。`requires` 的每个键须在 context 中存在并按现有 JSON 类型敏感规则相等。同一意图多条 pattern 命中时选普通词最多者，同数取靠前者；命中意图按 `priority` 降序、普通词数量降序、声明顺序升序排列。成功时返回 `status` 为 `MATCHED`、首名意图 id 及其 `slots`，以及按该顺序列出各命中意图 `id`、`priority`、`literal_count`、`pattern_index` 与 `slots` 的 `candidates`；无命中返回 `status` 为 `NO_MATCH`、`intent` 为 `null`、空 `slots` 与空 `candidates`。请求在匹配前完整校验：utterance 归一化后为空、intents 结构错误或为空、id 非法或重复、priority 非整数或为布尔值、requires 不是对象、patterns 含空项或非字符串、花括号槽位名非法，均返回 422 `invalid_dialogue`，不返回部分结果；JSON 无法解析返回 400 `invalid_json`。Python 侧等价入口为 `Service.match_dialogue_intent(request)`，同类错误抛出 `ValueError`。调用不修改传入的请求及其嵌套对象，也不保存跨请求状态。
 
+`POST /v1/schedules/decide` 执行一次性日程与需求决策：请求体为 `{"now": 600, "needs": {"hunger": 0.8}, "activities": [...]}`。`now` 是 0 到 1439 的整数分钟（布尔值不视为整数）；`needs` 是以非空字符串为键、以 0 到 1 有限数为值的对象；`activities` 是非空数组，每项含唯一非空字符串 `id`、0 到 1439 的整数 `start_minute` 与 `end_minute`、可省略的整数 `priority`（默认 0），以及可省略的 `need`；带 `need` 的活动还须引用已声明的需求键，并提供 0 到 1 的有限数 `trigger` 与 `relief`。日程窗口起点包含、终点不包含：起点小于终点为同日区间，起点大于终点为跨午夜区间，二者相等表示全天。活动在当前时刻位于窗口内即为 `scheduled`，其关联需求值大于等于 `trigger` 即为 `urgent`，二者之一即为 `eligible`。紧急活动始终优先于仅按日程可选的活动：多个紧急活动先取需求值较高者，再取 `priority` 较高者，仍相同取输入靠前者；仅按日程可选时按 `priority` 降序并以输入顺序破同分。选中后只把其关联需求更新为 `max(0, 原值减 relief)`，无关联需求的活动不改变需求。有可选活动时返回 `status` 为 `SELECTED`、选中的 `selected` id 与更新后的 `needs`；没有可选项时返回 `status` 为 `IDLE`、`selected` 为 `null` 与原始 `needs`；两种结果都返回按输入顺序列出每项 `id`、`scheduled`、`urgent`、`eligible` 与 `need_level`（无关联需求为 `null`）的 `evaluations`。请求在决策前完整校验：结构、标识、引用、类型、有限性或范围约束不满足时整体失败，返回 422 `invalid_schedule`，不返回部分结果；JSON 无法解析返回 400 `invalid_json`。Python 侧等价入口为 `Service.select_schedule_activity(request)`，同类错误抛出 `ValueError`。调用不修改传入的请求及其嵌套对象，也不保存跨请求状态。
+
 ## 验证
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策、一次性感知记忆更新、一次性局部避障选速、一次性无状态注意力评估与规则式对话意图匹配；难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。
+当前基线提供行为树的一次性求值、有限状态机的单步推进、一次性 GOAP 规划、无状态二维方格寻路、无状态效用决策、一次性感知记忆更新、一次性局部避障选速、一次性无状态注意力评估、规则式对话意图匹配与一次性日程与需求决策；难度自适应等能力仍留给后续任务从已冻结事实出发独立设计并验证。
