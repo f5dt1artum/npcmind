@@ -357,8 +357,13 @@ def _validate_sm_action(action: Any, where: str) -> None:
         raise MachineError(f"{where}: action op 'set' requires a value")
 
 
-def _validate_machine(machine: Any) -> set[str]:
-    """Validate a machine definition fully; return the declared state ids."""
+def _validate_machine(machine: Any) -> tuple[set[str], dict[str, str | None], dict[str, str]]:
+    """Validate a machine definition fully.
+
+    Returns ``(state_ids, parents, initials)``: ``parents`` maps every state
+    id to its parent id (``None`` for root states) and ``initials`` maps
+    every composite state id to the id of its initial direct child.
+    """
     if not isinstance(machine, dict):
         raise MachineError("machine must be an object")
     states = machine.get("states")
@@ -373,9 +378,58 @@ def _validate_machine(machine: Any) -> set[str]:
             raise MachineError(f"duplicate state id {state_id!r}")
         state_ids.add(state_id)
 
+    # Hierarchy: each state may name at most one parent via a single
+    # ``parent`` string; the links must not self-reference or form a cycle.
+    parents: dict[str, str | None] = {}
+    children: dict[str, list[str]] = {state_id: [] for state_id in state_ids}
+    for state in states:
+        if not isinstance(state, dict):
+            state_id = state
+            parent = None
+        else:
+            state_id = state["id"]
+            parent = state.get("parent")
+        if parent is None:
+            parents[state_id] = None
+            continue
+        if not isinstance(parent, str) or parent not in state_ids:
+            raise MachineError(f"state {state_id!r}: parent references unknown state {parent!r}")
+        if parent == state_id:
+            raise MachineError(f"state {state_id!r}: parent must not be the state itself")
+        parents[state_id] = parent
+        children[parent].append(state_id)
+    for state_id in state_ids:
+        seen = {state_id}
+        node = state_id
+        while parents[node] is not None:
+            node = parents[node]
+            if node in seen:
+                raise MachineError(f"state hierarchy contains a cycle involving {node!r}")
+            seen.add(node)
+
+    # A composite state (one with children) must name one direct child as
+    # its ``initial``; a leaf state must not declare an ``initial`` at all.
+    initials: dict[str, str] = {}
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        state_id = state["id"]
+        has_initial = "initial" in state
+        if children[state_id]:
+            child_initial = state.get("initial")
+            if not isinstance(child_initial, str) or child_initial not in children[state_id]:
+                raise MachineError(
+                    f"composite state {state_id!r}: initial must reference a direct child state"
+                )
+            initials[state_id] = child_initial
+        elif has_initial:
+            raise MachineError(f"leaf state {state_id!r} must not declare an initial")
+
     initial = machine.get("initial")
     if not isinstance(initial, str) or initial not in state_ids:
         raise MachineError(f"initial references unknown state {initial!r}")
+    if parents[initial] is not None:
+        raise MachineError(f"initial must reference a root state, but {initial!r} has a parent")
 
     transitions = machine.get("transitions")
     if not isinstance(transitions, list):
@@ -405,7 +459,26 @@ def _validate_machine(machine: Any) -> set[str]:
             raise MachineError(f"{where}: actions must be a list")
         for action_index, action in enumerate(actions):
             _validate_sm_action(action, f"{where}.actions[{action_index}]")
-    return state_ids
+    return state_ids, parents, initials
+
+
+def _sm_expand_leaf(state: str, initials: dict[str, str]) -> str:
+    """Expand a state to a leaf by following composite ``initial`` links."""
+    seen = {state}
+    while state in initials:
+        state = initials[state]
+        if state in seen:
+            raise MachineError(f"state {state!r} cannot be expanded to a leaf state")
+        seen.add(state)
+    return state
+
+
+def _sm_ancestor_chain(leaf: str, parents: dict[str, str | None]) -> list[str]:
+    """The leaf state followed by its ancestors up to the root."""
+    chain = [leaf]
+    while parents[chain[-1]] is not None:
+        chain.append(parents[chain[-1]])
+    return chain
 
 
 def _sm_condition_holds(condition: dict | None, blackboard: dict) -> bool:
@@ -635,11 +708,22 @@ class Service:
         """Advance ``request['machine']`` by exactly one ``request['event']``.
 
         The machine and the request are validated in full before any action
-        runs. The first transition (in declaration order) whose ``from``
-        equals the current state, whose ``event`` matches exactly, and whose
-        condition holds is taken; its actions then run in order. Raises
-        ValueError (MachineError) on any structural problem; a step that
-        matches no transition is not an error.
+        runs. States form a hierarchy: a state object may name one ``parent``
+        state, a composite state (one with children) must name a direct
+        child as its ``initial``, and ``machine.initial`` must be a root
+        state. The current state (``request['current_state']``, defaulting
+        to ``machine.initial``) and every transition target are expanded to
+        leaf states by following composite ``initial`` links recursively.
+
+        Candidate transitions are sought from the current leaf state up
+        through its ancestors to the root: a deeper source level is
+        considered as a whole before any shallower one, and within one
+        level transitions are checked in declaration order. The first
+        transition whose ``from`` equals the level's state, whose ``event``
+        matches exactly, and whose condition holds is taken; its actions
+        then run in order, exactly once. Raises ValueError (MachineError)
+        on any structural problem; a step that matches no transition is
+        not an error.
         """
         if not isinstance(request, dict):
             raise MachineError("request must be a JSON object")
@@ -656,22 +740,26 @@ class Service:
             if not _is_valid_key(key):
                 raise MachineError(f"blackboard key {key!r} must be a non-empty string")
 
-        state_ids = _validate_machine(machine)
+        state_ids, parents, initials = _validate_machine(machine)
 
         current = request.get("current_state", machine["initial"])
         if not isinstance(current, str) or current not in state_ids:
             raise MachineError(f"current_state references unknown state {current!r}")
+        current = _sm_expand_leaf(current, initials)
 
         board = dict(blackboard)
         trace: list = []
         matched = None
-        for transition in machine["transitions"]:
-            if transition["from"] != current or transition["event"] != event:
-                continue
-            holds = _sm_condition_holds(transition.get("condition"), board)
-            trace.append({"id": transition["id"], "condition": holds})
-            if holds:
-                matched = transition
+        for source in _sm_ancestor_chain(current, parents):
+            for transition in machine["transitions"]:
+                if transition["from"] != source or transition["event"] != event:
+                    continue
+                holds = _sm_condition_holds(transition.get("condition"), board)
+                trace.append({"id": transition["id"], "condition": holds})
+                if holds:
+                    matched = transition
+                    break
+            if matched is not None:
                 break
 
         if matched is None:
@@ -690,7 +778,7 @@ class Service:
                 board.pop(action["key"], None)
         return {
             "previous_state": current,
-            "state": matched["to"],
+            "state": _sm_expand_leaf(matched["to"], initials),
             "transition": matched["id"],
             "blackboard": board,
             "trace": trace,
