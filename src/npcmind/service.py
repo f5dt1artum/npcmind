@@ -14,7 +14,9 @@ context once and picks the best; each ``update_perception`` call validates
 the supplied memory and observations once and returns the merged memory;
 each ``select_avoidance`` call predicts disc collisions for the supplied
 candidate velocities over one time horizon and picks one admissible
-velocity. No state is kept between calls.
+velocity; each ``select_attention`` call scores the supplied memory
+entities against the supplied observer once and picks the most salient.
+No state is kept between calls.
 """
 
 from __future__ import annotations
@@ -59,6 +61,10 @@ class PerceptionError(ValueError):
 
 class SteeringError(ValueError):
     """Raised when a local-avoidance steering request fails validation."""
+
+
+class AttentionError(ValueError):
+    """Raised when an attention-selection request fails validation."""
 
 
 _UTILITY_CURVES = ("linear", "inverse")
@@ -461,6 +467,21 @@ def _validate_vector(value: Any, where: str) -> tuple[float, float]:
     return float(x), float(y)
 
 
+def _validate_attention_vector(value: Any, where: str) -> tuple[float, float]:
+    """Validate ``{"x": finite, "y": finite}`` for an attention request."""
+    if not isinstance(value, dict):
+        raise AttentionError(f"{where} must be an object")
+    if "x" not in value or "y" not in value:
+        raise AttentionError(f"{where} requires finite-number fields x and y")
+    x = value["x"]
+    y = value["y"]
+    if not _is_finite_number(x):
+        raise AttentionError(f"{where}.x must be a finite number")
+    if not _is_finite_number(y):
+        raise AttentionError(f"{where}.y must be a finite number")
+    return float(x), float(y)
+
+
 def _disc_collides(
     rel_pos: tuple[float, float],
     rel_vel: tuple[float, float],
@@ -491,7 +512,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention."""
     name = "npcmind"
     version = __version__
 
@@ -1128,5 +1149,154 @@ class Service:
             "status": "SELECTED",
             "selected": selected_id,
             "velocity": selected_velocity,
+            "evaluations": evaluations,
+        }
+
+    def select_attention(self, request: Any) -> dict:
+        """Score remembered entities for attention and pick the most salient.
+
+        The request is validated in full before any entity is evaluated.
+        ``observer`` has a finite ``position`` vector, a non-zero finite
+        ``forward`` vector, a positive finite ``max_distance`` and a
+        ``field_of_view_degrees`` in ``(0, 360]``; ``now`` is a non-negative
+        finite number and ``memory_horizon`` a positive finite number.
+        ``memory`` is a list (possibly empty) of perception-memory records,
+        each with a unique non-empty string ``id``, ``kind``, ``last_seen``
+        (non-negative finite, no later than ``now``), ``confidence`` in
+        ``[0, 1]``, a finite ``position`` and an optional JSON ``data``;
+        ``data.threat`` defaults to ``0`` and, when present, must be a finite
+        number in ``[0, 1]``.
+
+        An entity coincident with the observer is visible with proximity
+        ``1``. Otherwise it is visible only when its distance is at most
+        ``max_distance`` and the angle between the (un-normalised) entity
+        direction and ``forward`` is at most half the field of view (a
+        360-degree view ignores facing); either boundary counts as visible.
+        Every record gets ``proximity = max(0, 1 - distance / max_distance)``,
+        ``freshness = max(0, 1 - (now - last_seen) / memory_horizon)`` and a
+        ``score`` of ``confidence * threat * proximity * freshness`` when
+        visible (``0`` when not). The highest positive score wins, ties going
+        to the record listed first; with no positive score the result is
+        ``NO_TARGET`` with null ``selected`` and ``score``. ``evaluations``
+        always lists every record in input order with ``id``, ``visible``,
+        ``distance``, ``threat``, ``proximity``, ``freshness`` and ``score``.
+        Raises ValueError (AttentionError) on any invalid input; the request
+        is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise AttentionError("request must be a JSON object")
+
+        for field in ("observer", "now", "memory_horizon", "memory"):
+            if field not in request:
+                raise AttentionError(f"request is missing {field!r}")
+
+        observer = request["observer"]
+        if not isinstance(observer, dict):
+            raise AttentionError("observer must be an object")
+        observer_pos = _validate_attention_vector(observer.get("position"), "observer.position")
+        forward = _validate_attention_vector(observer.get("forward"), "observer.forward")
+        if forward == (0.0, 0.0):
+            raise AttentionError("observer.forward must be a non-zero vector")
+        max_distance = observer.get("max_distance")
+        if not _is_finite_number(max_distance) or max_distance <= 0:
+            raise AttentionError("observer.max_distance must be a positive finite number")
+        fov = observer.get("field_of_view_degrees")
+        if not _is_finite_number(fov) or not 0 < fov <= 360:
+            raise AttentionError(
+                "observer.field_of_view_degrees must be a finite number in (0, 360]"
+            )
+
+        now = request["now"]
+        if not _is_finite_number(now) or now < 0:
+            raise AttentionError("now must be a non-negative finite number")
+        horizon = request["memory_horizon"]
+        if not _is_finite_number(horizon) or horizon <= 0:
+            raise AttentionError("memory_horizon must be a positive finite number")
+        memory = request["memory"]
+        if not isinstance(memory, list):
+            raise AttentionError("memory must be a list")
+
+        parsed_memory: list[dict] = []
+        memory_ids: set[str] = set()
+        for index, entity in enumerate(memory):
+            where = f"memory[{index}]"
+            try:
+                parsed = _validate_perception_entity(entity, where, now, last_seen_required=True)
+            except PerceptionError as exc:
+                raise AttentionError(str(exc)) from exc
+            if parsed["id"] in memory_ids:
+                raise AttentionError(f"duplicate memory id {parsed['id']!r}")
+            memory_ids.add(parsed["id"])
+            if "threat" in parsed["data"]:
+                threat = parsed["data"]["threat"]
+                if not _is_finite_number(threat) or not 0 <= threat <= 1:
+                    raise AttentionError(
+                        f"{where}.data.threat must be a finite number between 0 and 1"
+                    )
+            else:
+                parsed["data"]["threat"] = 0
+            parsed_memory.append(parsed)
+
+        max_distance_f = float(max_distance)
+        half_view = math.radians(fov) / 2.0
+        forward_len = math.hypot(forward[0], forward[1])
+        fx, fy = forward[0] / forward_len, forward[1] / forward_len
+
+        evaluations: list[dict] = []
+        selected: str | None = None
+        selected_score: float | None = None
+        for entity in parsed_memory:
+            dx = float(entity["position"]["x"]) - observer_pos[0]
+            dy = float(entity["position"]["y"]) - observer_pos[1]
+            distance = math.hypot(dx, dy)
+            threat = entity["data"]["threat"]
+            proximity = max(0.0, 1.0 - distance / max_distance_f)
+            age = float(now) - float(entity["last_seen"])
+            freshness = max(0.0, 1.0 - age / float(horizon))
+            if distance == 0.0:
+                visible = True
+                proximity = 1.0
+            elif distance > max_distance_f:
+                visible = False
+            elif fov == 360:
+                visible = True
+            else:
+                # atan2(|cross|, dot) gives the unsigned angle in [0, pi];
+                # a tiny tolerance keeps an exact cone boundary visible.
+                angle = math.atan2(abs(fx * dy - fy * dx), fx * dx + fy * dy)
+                visible = angle <= half_view + 1e-9
+            score = (
+                float(entity["confidence"]) * float(threat) * proximity * freshness
+                if visible
+                else 0.0
+            )
+            evaluations.append(
+                {
+                    "id": entity["id"],
+                    "visible": visible,
+                    "distance": distance,
+                    "threat": threat,
+                    "proximity": proximity,
+                    "freshness": freshness,
+                    "score": score,
+                }
+            )
+            # Records are visited in input order and the strict comparison
+            # keeps the first one on an equal score; zero never selects.
+            if score > 0.0 and (selected_score is None or score > selected_score):
+                selected = entity["id"]
+                selected_score = score
+
+        if selected is None:
+            return {
+                "status": "NO_TARGET",
+                "selected": None,
+                "score": None,
+                "evaluations": evaluations,
+            }
+        return {
+            "status": "SELECTED",
+            "selected": selected,
+            "score": selected_score,
             "evaluations": evaluations,
         }
