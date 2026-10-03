@@ -1,7 +1,8 @@
 """Core service surface for NpcMind.
 
 Provides process health reporting, a stateless behavior-tree evaluator, a
-single-step finite-state-machine driver, one-shot goal-oriented action
+stateless behavior-tree graph projection, a single-step finite-state-machine
+driver, one-shot goal-oriented action
 planning, stateless 2D grid navigation, stateless utility scoring, and a
 one-shot perception-memory merge. Each ``evaluate_behavior`` call executes
 exactly one tick of the supplied tree against the supplied blackboard; each
@@ -46,6 +47,10 @@ _ACTION_OPS = ("set", "delete", "status")
 
 class TreeError(ValueError):
     """Raised when a behavior-tree request fails structural validation."""
+
+
+class BehaviorVisualizationError(ValueError):
+    """Raised when a behavior-tree visualization request fails validation."""
 
 
 class MachineError(ValueError):
@@ -681,7 +686,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams, difficulty."""
+    """Health, behavior trees (evaluate and export), FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams, difficulty."""
     name = "npcmind"
     version = __version__
 
@@ -712,6 +717,105 @@ class Service:
         trace: list = []
         status = _tick(tree, board, trace)
         return {"status": status, "blackboard": board, "trace": trace}
+
+    def export_behavior_tree(self, request: Any) -> dict:
+        """Project ``request['tree']`` and an optional trace to a flat graph.
+
+        Only structure and already-computed trace entries are reorganised;
+        no node is executed and no blackboard is touched. ``trace`` defaults
+        to an empty array when omitted and must be the trace array returned
+        by :meth:`evaluate_behavior`: each entry is an object with a
+        non-empty string ``id`` that exists in the tree, a ``type`` matching
+        that node, a ``status`` of ``SUCCESS``, ``FAILURE`` or ``RUNNING``,
+        and no id may occur twice.
+
+        On success returns ``status`` ``EXPORTED``, ``nodes`` in
+        depth-first pre-order (root first, children in declaration order)
+        each with ``id``, ``type``, ``depth``, ``visited`` and ``status``
+        (the trace value for visited nodes, ``null`` for the rest),
+        ``edges`` ordered by the parent's pre-order position and within a
+        parent by child order, each with ``from``, ``to`` and a zero-based
+        ``index``, and ``trace_order`` listing the trace ids in input order.
+        Raises ValueError (BehaviorVisualizationError) when the request,
+        tree or trace is invalid; no partial graph is produced. The request
+        and its nested values are never mutated and no state is kept.
+        """
+        if not isinstance(request, dict):
+            raise BehaviorVisualizationError("request must be a JSON object")
+        if "tree" not in request:
+            raise BehaviorVisualizationError("request is missing 'tree'")
+        tree = request["tree"]
+        trace = request.get("trace", [])
+        if not isinstance(trace, list):
+            raise BehaviorVisualizationError("trace must be an array")
+
+        seen_ids: set[str] = set()
+        _validate_node(tree, "root", seen_ids)
+
+        # Depth-first pre-order walk; nodes carry their depth and keep a
+        # reference to the raw node so edges can be emitted grouped by the
+        # parent's pre-order position.
+        nodes: list[dict] = []
+        node_types: dict[str, str] = {}
+        node_objects: dict[str, dict] = {}
+
+        def walk(node: dict, depth: int) -> None:
+            node_id = node["id"]
+            node_type = node["type"]
+            node_types[node_id] = node_type
+            node_objects[node_id] = node
+            nodes.append(
+                {"id": node_id, "type": node_type, "depth": depth, "visited": False, "status": None}
+            )
+            if node_type in _COMPOSITE_TYPES:
+                for child in node.get("children", []):
+                    walk(child, depth + 1)
+
+        walk(tree, 0)
+
+        # Edges follow the parent's pre-order position; within one parent
+        # the declared children order is kept, and the global index runs
+        # continuously from zero. Leaves contribute nothing.
+        edges: list[dict] = []
+        edge_index = 0
+        for entry in nodes:
+            node = node_objects[entry["id"]]
+            if node["type"] not in _COMPOSITE_TYPES:
+                continue
+            for child in node.get("children", []):
+                edges.append({"from": node["id"], "to": child["id"], "index": edge_index})
+                edge_index += 1
+
+        nodes_by_id = {entry["id"]: entry for entry in nodes}
+        trace_order: list[str] = []
+        trace_ids: set[str] = set()
+        for position, entry in enumerate(trace):
+            where = f"trace[{position}]"
+            if not isinstance(entry, dict):
+                raise BehaviorVisualizationError(f"{where} must be an object")
+            entry_id = entry.get("id")
+            if not _is_valid_key(entry_id):
+                raise BehaviorVisualizationError(f"{where} requires a non-empty string id")
+            if entry_id in trace_ids:
+                raise BehaviorVisualizationError(f"{where}: duplicate trace id {entry_id!r}")
+            if entry_id not in node_types:
+                raise BehaviorVisualizationError(
+                    f"{where}: id {entry_id!r} does not exist in the tree"
+                )
+            entry_type = entry.get("type")
+            if entry_type != node_types[entry_id]:
+                raise BehaviorVisualizationError(
+                    f"{where}: type {entry_type!r} does not match tree node {entry_id!r}"
+                )
+            entry_status = entry.get("status")
+            if entry_status not in STATUSES:
+                raise BehaviorVisualizationError(f"{where}: illegal status {entry_status!r}")
+            trace_ids.add(entry_id)
+            trace_order.append(entry_id)
+            nodes_by_id[entry_id]["visited"] = True
+            nodes_by_id[entry_id]["status"] = entry_status
+
+        return {"status": "EXPORTED", "nodes": nodes, "edges": edges, "trace_order": trace_order}
 
     def step_state_machine(self, request: dict) -> dict:
         """Advance ``request['machine']`` by exactly one ``request['event']``.
