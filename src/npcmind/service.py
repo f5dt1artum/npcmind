@@ -15,14 +15,17 @@ the supplied memory and observations once and returns the merged memory;
 each ``select_avoidance`` call predicts disc collisions for the supplied
 candidate velocities over one time horizon and picks one admissible
 velocity; each ``select_attention`` call scores the supplied memory
-entities against the supplied observer once and picks the most salient.
-No state is kept between calls.
+entities against the supplied observer once and picks the most salient;
+each ``match_dialogue_intent`` call matches the supplied utterance
+against the supplied rule-based intent patterns once. No state is kept
+between calls.
 """
 
 from __future__ import annotations
 
 import heapq
 import math
+import re
 from copy import deepcopy
 from fractions import Fraction
 from typing import Any
@@ -65,6 +68,59 @@ class SteeringError(ValueError):
 
 class AttentionError(ValueError):
     """Raised when an attention-selection request fails validation."""
+
+
+class DialogueError(ValueError):
+    """Raised when a dialogue-intent request fails validation."""
+
+
+_SLOT_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _parse_dialogue_pattern(pattern: Any, where: str) -> list[tuple[str, str]]:
+    """Validate one pattern string; return its ``(kind, value)`` tokens.
+
+    Literal tokens are stored casefolded; slot tokens store their name.
+    """
+    if not isinstance(pattern, str):
+        raise DialogueError(f"{where} must be a string")
+    tokens = pattern.split()
+    if not tokens:
+        raise DialogueError(f"{where} must not be empty")
+    parsed: list[tuple[str, str]] = []
+    for token in tokens:
+        if "{" in token or "}" in token:
+            match = _SLOT_TOKEN_RE.fullmatch(token)
+            if match is None:
+                raise DialogueError(f"{where}: invalid slot token {token!r}")
+            parsed.append(("slot", match.group(1)))
+        else:
+            parsed.append(("literal", token.casefold()))
+    return parsed
+
+
+def _match_dialogue_pattern(parsed: list[tuple[str, str]], tokens: list[str]) -> dict | None:
+    """Match a parsed pattern against the utterance tokens.
+
+    The pattern must cover the whole utterance. Returns the slot mapping
+    (original utterance text) on a match, ``None`` otherwise.
+    """
+    if len(parsed) != len(tokens):
+        return None
+    slots: dict[str, str] = {}
+    normalised: dict[str, str] = {}
+    for (kind, value), token in zip(parsed, tokens):
+        folded = token.casefold()
+        if kind == "literal":
+            if value != folded:
+                return None
+        elif value in normalised:
+            if normalised[value] != folded:
+                return None
+        else:
+            normalised[value] = folded
+            slots[value] = token
+    return slots
 
 
 _UTILITY_CURVES = ("linear", "inverse")
@@ -512,7 +568,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention."""
+    """Health, behavior trees, FSM, GOAP, navigation, utility, perception, steering, attention, dialogue."""
     name = "npcmind"
     version = __version__
 
@@ -1299,4 +1355,123 @@ class Service:
             "selected": selected,
             "score": selected_score,
             "evaluations": evaluations,
+        }
+
+    def match_dialogue_intent(self, request: Any) -> dict:
+        """Match an utterance against rule-based intent patterns once.
+
+        The request is validated in full before any matching happens.
+        ``utterance`` is a string whose whitespace-normalised form is
+        non-empty; ``intents`` is a non-empty list; ``context`` is an
+        optional object (default ``{}``). Each intent requires a unique
+        non-empty string ``id``, a non-empty ``patterns`` list of
+        non-empty strings, an optional integer ``priority`` (default
+        ``0``; booleans are not integers) and an optional ``requires``
+        object constraining the context.
+
+        Utterance and patterns are tokenised on runs of Unicode
+        whitespace after stripping; comparison uses Unicode casefold
+        while reported slot values keep the original utterance text. A
+        pattern token of the exact form ``{name}`` (an ASCII letter or
+        underscore followed by ASCII letters, digits or underscores) is
+        a slot matching exactly one token; a repeated slot name must
+        capture casefold-equal values. Every other token is a literal
+        that must equal the utterance token. A pattern matches only when
+        it covers the whole utterance, and an intent matches only when
+        every ``requires`` key exists in the context with an equal value
+        under JSON type-sensitive equality.
+
+        When several patterns of one intent match, the one with the most
+        literal tokens wins, ties going to the earliest pattern. Matched
+        intents are ordered by descending ``priority``, then descending
+        literal count, then declaration order. The result is ``MATCHED``
+        with the first intent's ``id`` and ``slots`` plus a
+        ``candidates`` list (``id``, ``priority``, ``literal_count``,
+        ``pattern_index``, ``slots``) in that order, or ``NO_MATCH``
+        with null ``intent`` and empty ``slots``/``candidates``. Raises
+        ValueError (DialogueError) on any invalid input; the request is
+        never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise DialogueError("request must be a JSON object")
+        utterance = request.get("utterance")
+        if not isinstance(utterance, str):
+            raise DialogueError("utterance must be a string")
+        utterance_tokens = utterance.split()
+        if not utterance_tokens:
+            raise DialogueError("utterance must not be empty")
+        intents = request.get("intents")
+        if not isinstance(intents, list) or not intents:
+            raise DialogueError("intents must be a non-empty list")
+        context = request.get("context", {})
+        if not isinstance(context, dict):
+            raise DialogueError("context must be an object")
+
+        parsed_intents: list[tuple[str, int, dict, list]] = []
+        seen_ids: set[str] = set()
+        for index, intent in enumerate(intents):
+            where = f"intent at intents[{index}]"
+            if not isinstance(intent, dict):
+                raise DialogueError(f"{where} must be an object")
+            intent_id = intent.get("id")
+            if not _is_valid_key(intent_id):
+                raise DialogueError(f"{where} requires a non-empty string id")
+            if intent_id in seen_ids:
+                raise DialogueError(f"duplicate intent id {intent_id!r}")
+            seen_ids.add(intent_id)
+            where = f"intent {intent_id!r}"
+            priority = intent.get("priority", 0)
+            if isinstance(priority, bool) or not isinstance(priority, int):
+                raise DialogueError(f"{where}: priority must be an integer")
+            requires = intent.get("requires", {})
+            if not isinstance(requires, dict):
+                raise DialogueError(f"{where}: requires must be an object")
+            patterns = intent.get("patterns")
+            if not isinstance(patterns, list) or not patterns:
+                raise DialogueError(f"{where}: patterns must be a non-empty list")
+            parsed_patterns = [
+                _parse_dialogue_pattern(pattern, f"{where} pattern at patterns[{p_index}]")
+                for p_index, pattern in enumerate(patterns)
+            ]
+            parsed_intents.append((intent_id, priority, requires, parsed_patterns))
+
+        matched: list[tuple[str, int, int, int, dict, int]] = []
+        for order, (intent_id, priority, requires, parsed_patterns) in enumerate(parsed_intents):
+            if not all(
+                key in context and _json_equal(context[key], value)
+                for key, value in requires.items()
+            ):
+                continue
+            best: tuple[int, int, dict] | None = None
+            for pattern_index, parsed in enumerate(parsed_patterns):
+                slots = _match_dialogue_pattern(parsed, utterance_tokens)
+                if slots is None:
+                    continue
+                literal_count = sum(1 for kind, _ in parsed if kind == "literal")
+                # Patterns are visited in declaration order and the strict
+                # comparison keeps the earliest one on an equal count.
+                if best is None or literal_count > best[0]:
+                    best = (literal_count, pattern_index, slots)
+            if best is not None:
+                matched.append((intent_id, priority, best[0], best[1], best[2], order))
+
+        matched.sort(key=lambda item: (-item[1], -item[2], item[5]))
+        if not matched:
+            return {"status": "NO_MATCH", "intent": None, "slots": {}, "candidates": []}
+        candidates = [
+            {
+                "id": intent_id,
+                "priority": priority,
+                "literal_count": literal_count,
+                "pattern_index": pattern_index,
+                "slots": slots,
+            }
+            for intent_id, priority, literal_count, pattern_index, slots, _ in matched
+        ]
+        first = matched[0]
+        return {
+            "status": "MATCHED",
+            "intent": first[0],
+            "slots": first[4],
+            "candidates": candidates,
         }
