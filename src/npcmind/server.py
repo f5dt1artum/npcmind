@@ -30,6 +30,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/goap/plan": ("plan_goap", "invalid_goap"),
         "/v1/navigation/path": ("find_path", "invalid_navigation"),
         "/v1/utility/select": ("select_utility", "invalid_utility"),
+        "/v1/perception/memory": ("update_perception", "invalid_perception"),
     }
 
     def send_json(self, status: int, payload: dict) -> None:
