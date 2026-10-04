@@ -15,7 +15,9 @@ context once and picks the best; each ``update_perception`` call validates
 the supplied memory and observations once and returns the merged memory;
 each ``select_avoidance`` call predicts disc collisions for the supplied
 candidate velocities over one time horizon and picks one admissible
-velocity; each ``select_attention`` call scores the supplied memory
+velocity; each ``steer_flock`` call combines the separation, alignment and
+cohesion of the supplied neighbours into one steering acceleration and one
+updated velocity; each ``select_attention`` call scores the supplied memory
 entities against the supplied observer once and picks the most salient;
 each ``match_dialogue_intent`` call matches the supplied utterance
 against the supplied rule-based intent patterns once; each
@@ -79,6 +81,10 @@ class PerceptionError(ValueError):
 
 class SteeringError(ValueError):
     """Raised when a local-avoidance steering request fails validation."""
+
+
+class FlockingError(ValueError):
+    """Raised when a flocking steering request fails validation."""
 
 
 class AttentionError(ValueError):
@@ -694,6 +700,30 @@ def _validate_vector(value: Any, where: str) -> tuple[float, float]:
     return float(x), float(y)
 
 
+def _validate_flock_vector(value: Any, where: str) -> tuple[float, float]:
+    """Validate ``{"x": finite, "y": finite}`` for a flocking request."""
+    if not isinstance(value, dict):
+        raise FlockingError(f"{where} must be an object")
+    if "x" not in value or "y" not in value:
+        raise FlockingError(f"{where} requires finite-number fields x and y")
+    x = value["x"]
+    y = value["y"]
+    if not _is_finite_number(x):
+        raise FlockingError(f"{where}.x must be a finite number")
+    if not _is_finite_number(y):
+        raise FlockingError(f"{where}.y must be a finite number")
+    return float(x), float(y)
+
+
+def _limit_vector(x: float, y: float, limit: float) -> tuple[float, float]:
+    """Scale ``(x, y)`` down to ``limit`` when longer; zero stays zero."""
+    length = math.hypot(x, y)
+    if length > limit:
+        scale = limit / length
+        return x * scale, y * scale
+    return x, y
+
+
 def _validate_attention_vector(value: Any, where: str) -> tuple[float, float]:
     """Validate ``{"x": finite, "y": finite}`` for an attention request."""
     if not isinstance(value, dict):
@@ -739,7 +769,7 @@ def _disc_collides(
 
 
 class Service:
-    """Health, behavior trees (evaluate and export), FSM, GOAP, navigation, utility, perception, steering, attention, dialogue, schedules, teams, difficulty."""
+    """Health, behavior trees (evaluate and export), FSM, GOAP, navigation, utility, perception, steering (avoidance and flocking), attention, dialogue, schedules, teams, difficulty."""
     name = "npcmind"
     version = __version__
 
@@ -1513,6 +1543,167 @@ class Service:
             "selected": selected_id,
             "velocity": selected_velocity,
             "evaluations": evaluations,
+        }
+
+    def steer_flock(self, request: Any) -> dict:
+        """Steer one agent with the separation/alignment/cohesion flock rules.
+
+        The request is validated in full before any steering happens. The
+        agent has a non-empty string ``id``, finite ``position`` and
+        ``velocity`` vectors; ``neighbors`` is a (possibly empty) list of
+        objects with the same three fields, whose ids are non-empty strings
+        unique across the agent and all neighbours. ``perception_radius``,
+        ``separation_radius``, ``max_speed``, ``max_acceleration`` and
+        ``delta_time`` are positive finite numbers with
+        ``separation_radius <= perception_radius``; ``separation``,
+        ``alignment`` and ``cohesion`` are non-negative finite weights.
+
+        Neighbours within ``perception_radius`` (boundary included) are
+        selected in input order. The unweighted ``separation`` component sums
+        ``(self - neighbour) / distance**2`` over the selected neighbours
+        within ``separation_radius`` (boundary included; coincident
+        neighbours contribute zero), ``alignment`` is the selected
+        neighbours' mean velocity minus the agent's, and ``cohesion`` their
+        mean position minus the agent's. The weighted sum of the three
+        components, truncated to ``max_acceleration``, gives ``acceleration``;
+        ``velocity + acceleration * delta_time`` truncated to ``max_speed``
+        gives the new ``velocity``. With no perceived neighbour nothing is
+        truncated or updated: the result is ``NO_NEIGHBORS`` with the
+        original velocity and zero vectors, otherwise ``STEERED`` with
+        ``neighbor_ids`` in input order and the three unweighted components.
+        Raises ValueError (FlockingError) on any invalid input; the request
+        is never mutated and no state is kept between calls.
+        """
+        if not isinstance(request, dict):
+            raise FlockingError("request must be a JSON object")
+
+        for field in (
+            "id",
+            "position",
+            "velocity",
+            "neighbors",
+            "perception_radius",
+            "separation_radius",
+            "max_speed",
+            "max_acceleration",
+            "delta_time",
+            "separation",
+            "alignment",
+            "cohesion",
+        ):
+            if field not in request:
+                raise FlockingError(f"request is missing {field!r}")
+
+        agent_id = request["id"]
+        if not _is_valid_key(agent_id):
+            raise FlockingError("id must be a non-empty string")
+        agent_pos = _validate_flock_vector(request["position"], "position")
+        agent_vel = _validate_flock_vector(request["velocity"], "velocity")
+
+        neighbors_in = request["neighbors"]
+        if not isinstance(neighbors_in, list):
+            raise FlockingError("neighbors must be a list")
+
+        parsed_neighbors: list[tuple[str, tuple[float, float], tuple[float, float]]] = []
+        seen_ids = {agent_id}
+        for index, neighbor in enumerate(neighbors_in):
+            where = f"neighbor at neighbors[{index}]"
+            if not isinstance(neighbor, dict):
+                raise FlockingError(f"{where} must be an object")
+            neighbor_id = neighbor.get("id")
+            if not _is_valid_key(neighbor_id):
+                raise FlockingError(f"{where} requires a non-empty string id")
+            if neighbor_id in seen_ids:
+                raise FlockingError(f"duplicate id {neighbor_id!r}")
+            seen_ids.add(neighbor_id)
+            if "position" not in neighbor:
+                raise FlockingError(f"{where} is missing 'position'")
+            pos = _validate_flock_vector(neighbor["position"], f"{where} position")
+            if "velocity" not in neighbor:
+                raise FlockingError(f"{where} is missing 'velocity'")
+            vel = _validate_flock_vector(neighbor["velocity"], f"{where} velocity")
+            parsed_neighbors.append((neighbor_id, pos, vel))
+
+        perception_radius = request["perception_radius"]
+        if not _is_finite_number(perception_radius) or perception_radius <= 0:
+            raise FlockingError("perception_radius must be a positive finite number")
+        separation_radius = request["separation_radius"]
+        if not _is_finite_number(separation_radius) or separation_radius <= 0:
+            raise FlockingError("separation_radius must be a positive finite number")
+        if separation_radius > perception_radius:
+            raise FlockingError("separation_radius must not exceed perception_radius")
+        max_speed = request["max_speed"]
+        if not _is_finite_number(max_speed) or max_speed <= 0:
+            raise FlockingError("max_speed must be a positive finite number")
+        max_acceleration = request["max_acceleration"]
+        if not _is_finite_number(max_acceleration) or max_acceleration <= 0:
+            raise FlockingError("max_acceleration must be a positive finite number")
+        delta_time = request["delta_time"]
+        if not _is_finite_number(delta_time) or delta_time <= 0:
+            raise FlockingError("delta_time must be a positive finite number")
+        weights: dict[str, float] = {}
+        for name in ("separation", "alignment", "cohesion"):
+            weight = request[name]
+            if not _is_finite_number(weight) or weight < 0:
+                raise FlockingError(f"{name} must be a non-negative finite number")
+            weights[name] = float(weight)
+
+        # Select the perceived neighbours in input order, keeping each one's
+        # relative vector and distance for the component sums below.
+        px, py = agent_pos
+        vx, vy = agent_vel
+        perception = float(perception_radius)
+        perceived: list[tuple[str, tuple[float, float], tuple[float, float], float, float, float]] = []
+        for neighbor_id, pos, vel in parsed_neighbors:
+            dx = px - pos[0]
+            dy = py - pos[1]
+            distance = math.hypot(dx, dy)
+            if distance <= perception:
+                perceived.append((neighbor_id, pos, vel, dx, dy, distance))
+
+        if not perceived:
+            # No truncation or update: echo the original velocity verbatim
+            # (integers stay integers) with zero vectors everywhere else.
+            return {
+                "status": "NO_NEIGHBORS",
+                "neighbor_ids": [],
+                "separation": {"x": 0, "y": 0},
+                "alignment": {"x": 0, "y": 0},
+                "cohesion": {"x": 0, "y": 0},
+                "acceleration": {"x": 0, "y": 0},
+                "velocity": {"x": request["velocity"]["x"], "y": request["velocity"]["y"]},
+            }
+
+        separation = float(separation_radius)
+        sep_x = sep_y = 0.0
+        for _, _, _, dx, dy, distance in perceived:
+            if distance == 0.0 or distance > separation:
+                continue  # coincident neighbours contribute zero
+            inv = 1.0 / (distance * distance)
+            sep_x += dx * inv
+            sep_y += dy * inv
+
+        count = len(perceived)
+        align_x = sum(vel[0] for _, _, vel, _, _, _ in perceived) / count - vx
+        align_y = sum(vel[1] for _, _, vel, _, _, _ in perceived) / count - vy
+        cohere_x = sum(pos[0] for _, pos, _, _, _, _ in perceived) / count - px
+        cohere_y = sum(pos[1] for _, pos, _, _, _, _ in perceived) / count - py
+
+        acc_x = weights["separation"] * sep_x + weights["alignment"] * align_x + weights["cohesion"] * cohere_x
+        acc_y = weights["separation"] * sep_y + weights["alignment"] * align_y + weights["cohesion"] * cohere_y
+        acc_x, acc_y = _limit_vector(acc_x, acc_y, float(max_acceleration))
+
+        dt = float(delta_time)
+        new_vx, new_vy = _limit_vector(vx + acc_x * dt, vy + acc_y * dt, float(max_speed))
+
+        return {
+            "status": "STEERED",
+            "neighbor_ids": [neighbor_id for neighbor_id, *_ in perceived],
+            "separation": {"x": sep_x, "y": sep_y},
+            "alignment": {"x": align_x, "y": align_y},
+            "cohesion": {"x": cohere_x, "y": cohere_y},
+            "acceleration": {"x": acc_x, "y": acc_y},
+            "velocity": {"x": new_vx, "y": new_vy},
         }
 
     def select_attention(self, request: Any) -> dict:
