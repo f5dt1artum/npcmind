@@ -30,6 +30,7 @@ No state is kept between calls.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import math
 import re
@@ -41,8 +42,11 @@ from . import __version__
 
 STATUSES = ("SUCCESS", "FAILURE", "RUNNING")
 _COMPOSITE_TYPES = ("sequence", "selector")
+# Node types that carry a ``children`` array (used by the graph projection).
+_BRANCH_TYPES = ("sequence", "selector", "random_selector")
 _CONDITION_OPS = ("exists", "equals", "not_equals")
 _ACTION_OPS = ("set", "delete", "status")
+_MAX_SEED = 18446744073709551615  # 2**64 - 1
 
 
 class TreeError(ValueError):
@@ -251,7 +255,8 @@ def _json_equal(a: Any, b: Any) -> bool:
     return a == b
 
 
-def _validate_node(node: Any, path: str, seen_ids: set[str]) -> None:
+def _validate_node(node: Any, path: str, seen_ids: set[str]) -> bool:
+    """Validate one node subtree; return whether it contains a random_selector."""
     if not isinstance(node, dict):
         raise TreeError(f"node at {path} must be an object")
     node_id = node.get("id")
@@ -263,12 +268,31 @@ def _validate_node(node: Any, path: str, seen_ids: set[str]) -> None:
     where = f"node {node_id!r}"
 
     node_type = node.get("type")
+    has_random_selector = node_type == "random_selector"
     if node_type in _COMPOSITE_TYPES:
         children = node.get("children", [])
         if not isinstance(children, list):
             raise TreeError(f"{where}: children must be a list")
         for index, child in enumerate(children):
-            _validate_node(child, f"{path}.children[{index}]", seen_ids)
+            if _validate_node(child, f"{path}.children[{index}]", seen_ids):
+                has_random_selector = True
+    elif node_type == "random_selector":
+        children = node.get("children")
+        if not isinstance(children, list) or not children:
+            raise TreeError(f"{where}: children must be a non-empty list")
+        if "weights" in node:
+            weights = node["weights"]
+            if not isinstance(weights, list) or len(weights) != len(children):
+                raise TreeError(
+                    f"{where}: weights must be a list of positive integers "
+                    "matching the children count"
+                )
+            for weight in weights:
+                if isinstance(weight, bool) or not isinstance(weight, int) or weight <= 0:
+                    raise TreeError(f"{where}: weights must be positive integers")
+        for index, child in enumerate(children):
+            if _validate_node(child, f"{path}.children[{index}]", seen_ids):
+                has_random_selector = True
     elif node_type == "condition":
         op = node.get("op")
         if op not in _CONDITION_OPS:
@@ -289,6 +313,7 @@ def _validate_node(node: Any, path: str, seen_ids: set[str]) -> None:
             raise TreeError(f"{where}: illegal status {node.get('status')!r}")
     else:
         raise TreeError(f"{where}: unknown node type {node_type!r}")
+    return has_random_selector
 
 
 def _run_condition(node: dict, blackboard: dict) -> str:
@@ -316,20 +341,48 @@ def _run_action(node: dict, blackboard: dict) -> str:
     return node["status"]  # op == "status"
 
 
-def _tick(node: dict, blackboard: dict, trace: list) -> str:
+def _select_weighted_child(node: dict, seed: int) -> dict:
+    """Pick one direct child of a random_selector, deterministically.
+
+    The digest input is the decimal text of ``seed``, a half-width colon and
+    the node id, hashed as UTF-8 with SHA-256; the first eight digest bytes
+    read as an unsigned big-endian integer are reduced modulo the total
+    weight and the remainder selects the first cumulative weight interval
+    it falls into, in children order.
+    """
+    children = node["children"]
+    weights = node.get("weights")
+    if weights is None:
+        weights = [1] * len(children)
+    total = sum(weights)
+    digest = hashlib.sha256(f"{seed}:{node['id']}".encode("utf-8")).digest()
+    remainder = int.from_bytes(digest[:8], "big") % total
+    cumulative = 0
+    for child, weight in zip(children, weights):
+        cumulative += weight
+        if remainder < cumulative:
+            return child
+    return children[-1]  # unreachable: remainder < total
+
+
+def _tick(node: dict, blackboard: dict, trace: list, seed: int | None = None) -> str:
     node_type = node["type"]
     if node_type == "sequence":
         status = "SUCCESS"
         for child in node.get("children", []):
-            status = _tick(child, blackboard, trace)
+            status = _tick(child, blackboard, trace, seed)
             if status != "SUCCESS":
                 break
     elif node_type == "selector":
         status = "FAILURE"
         for child in node.get("children", []):
-            status = _tick(child, blackboard, trace)
+            status = _tick(child, blackboard, trace, seed)
             if status != "FAILURE":
                 break
+    elif node_type == "random_selector":
+        # Exactly one direct child runs; the other branches are never
+        # executed and produce no trace entries.
+        status = _tick(_select_weighted_child(node, seed), blackboard, trace, seed)
     elif node_type == "condition":
         status = _run_condition(node, blackboard)
     else:  # action
@@ -696,8 +749,13 @@ class Service:
     def evaluate_behavior(self, request: dict) -> dict:
         """Execute one tick of ``request['tree']`` against the blackboard.
 
-        Raises ValueError (TreeError) when the request structure, the tree,
-        or the blackboard is invalid; no partial result is produced.
+        When the tree contains a ``random_selector`` node the request must
+        also carry a ``seed``: an integer (booleans are not integers) between
+        0 and 18446744073709551615 inclusive. The same tree, blackboard and
+        seed always produce the same status, blackboard and trace; a ``seed``
+        supplied with a tree without random selectors is ignored. Raises
+        ValueError (TreeError) when the request structure, the tree, the
+        blackboard or the seed is invalid; no partial result is produced.
         """
         if not isinstance(request, dict):
             raise TreeError("request must be a JSON object")
@@ -711,11 +769,21 @@ class Service:
             if not _is_valid_key(key):
                 raise TreeError(f"blackboard key {key!r} must be a non-empty string")
 
-        _validate_node(tree, "root", set())
+        has_random_selector = _validate_node(tree, "root", set())
+
+        seed = None
+        if has_random_selector:
+            if "seed" not in request:
+                raise TreeError("request is missing 'seed' required by random_selector")
+            seed = request["seed"]
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise TreeError("seed must be an integer")
+            if not 0 <= seed <= _MAX_SEED:
+                raise TreeError(f"seed must be between 0 and {_MAX_SEED}")
 
         board = dict(blackboard)
         trace: list = []
-        status = _tick(tree, board, trace)
+        status = _tick(tree, board, trace, seed)
         return {"status": status, "blackboard": board, "trace": trace}
 
     def export_behavior_tree(self, request: Any) -> dict:
@@ -767,7 +835,7 @@ class Service:
             nodes.append(
                 {"id": node_id, "type": node_type, "depth": depth, "visited": False, "status": None}
             )
-            if node_type in _COMPOSITE_TYPES:
+            if node_type in _BRANCH_TYPES:
                 for child in node.get("children", []):
                     walk(child, depth + 1)
 
@@ -780,7 +848,7 @@ class Service:
         edge_index = 0
         for entry in nodes:
             node = node_objects[entry["id"]]
-            if node["type"] not in _COMPOSITE_TYPES:
+            if node["type"] not in _BRANCH_TYPES:
                 continue
             for child in node.get("children", []):
                 edges.append({"from": node["id"], "to": child["id"], "index": edge_index})
