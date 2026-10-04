@@ -33,6 +33,7 @@ class Handler(BaseHTTPRequestHandler):
         "/v1/utility/select": ("select_utility", "invalid_utility"),
         "/v1/perception/memory": ("update_perception", "invalid_perception"),
         "/v1/steering/avoid": ("select_avoidance", "invalid_steering"),
+        "/v1/steering/flock": ("steer_flock", "invalid_flocking"),
         "/v1/attention/select": ("select_attention", "invalid_attention"),
         "/v1/dialogue/intents/match": ("match_dialogue_intent", "invalid_dialogue"),
         "/v1/schedules/decide": ("select_schedule_activity", "invalid_schedule"),
